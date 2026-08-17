@@ -499,9 +499,6 @@ data: ${redactSecrets(body)}
   }
 }
 
-// src/bridge/dispatch.ts
-import { randomInt } from "node:crypto";
-
 // src/bridge/format.ts
 var MARKER_RE = /⟦bridge:(vk|tg|max):([^⟧]+)⟧/;
 function parseMarker(text) {
@@ -581,6 +578,51 @@ async function httpJson(url, opts = {}) {
   }
 }
 
+// src/bridge/media/types.ts
+var MAX_BRIDGE_FILE_BYTES = 45 * 1024 * 1024;
+var MAX_FILES_PER_MESSAGE = 8;
+
+// src/bridge/media/httpFiles.ts
+async function fetchBytes(url, opts = {}) {
+  const timeout = AbortSignal.timeout(opts.timeoutMs ?? 6e4);
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+  const res = await fetch(url, { method: "GET", headers: opts.headers, signal, redirect: "follow" });
+  if (!res.ok) {
+    throw new Error(`GET ${url} \u2192 HTTP ${res.status}`);
+  }
+  const cap = opts.maxBytes ?? MAX_BRIDGE_FILE_BYTES;
+  const buf = await readCapped(res, cap);
+  const mime = (res.headers.get("content-type") || "application/octet-stream").split(";")[0]?.trim() || "application/octet-stream";
+  return { bytes: buf, mime };
+}
+async function readCapped(res, maxBytes) {
+  const len = Number(res.headers.get("content-length") || 0);
+  if (len > maxBytes) throw new Error("file_too_large");
+  const raw = new Uint8Array(await res.arrayBuffer());
+  if (raw.byteLength > maxBytes) throw new Error("file_too_large");
+  return raw;
+}
+async function postFormJson(url, form, opts = {}) {
+  const timeout = AbortSignal.timeout(opts.timeoutMs ?? 9e4);
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: opts.headers,
+    body: form,
+    signal
+  });
+  const raw = await res.text();
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} POST ${url}: ${raw.slice(0, 400)}`);
+  }
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
 // src/bridge/lanchat.ts
 function lanFromSettings(s) {
   return { base: s.baseUrl.replace(/\/+$/, ""), lpat: s.lpat };
@@ -600,6 +642,19 @@ function lcTopic(base, token, path3, method = "GET", body, signal) {
     headers: { Authorization: `Bearer ${token}` },
     signal
   });
+}
+async function lcTopicSend(base, token, text, files, signal) {
+  const url = `${base.replace(/\/+$/, "")}/api/channels/send`;
+  const auth = { Authorization: `Bearer ${token}` };
+  if (files.length === 0) {
+    return httpJson(url, { method: "POST", data: { text }, headers: auth, signal, timeoutMs: 6e4 });
+  }
+  const form = new FormData();
+  form.append("text", text);
+  for (const file of files) {
+    form.append("file", new Blob([file.bytes], { type: file.mime || "application/octet-stream" }), file.filename);
+  }
+  return postFormJson(url, form, { headers: auth, signal, timeoutMs: 12e4 });
 }
 
 // src/bridge/logger.ts
@@ -632,93 +687,175 @@ function recordEvent(input) {
   broadcastLive({ event: "bridge-event", data: row });
 }
 
-// src/bridge/dispatch.ts
-var ownIds = /* @__PURE__ */ new Set();
-var ownOrder = [];
-function rememberOwn(mid) {
-  if (!mid) return;
-  if (ownIds.has(mid)) return;
-  ownIds.add(mid);
-  ownOrder.push(mid);
-  while (ownOrder.length > 8e3) {
-    const old = ownOrder.shift();
-    if (old) ownIds.delete(old);
+// src/bridge/media/gate.ts
+var BLOCKED_EXTENSIONS = new Set(
+  [
+    ".html",
+    ".htm",
+    ".xhtml",
+    ".xml",
+    ".shtml",
+    ".php",
+    ".php3",
+    ".php4",
+    ".php5",
+    ".phtml",
+    ".phar",
+    ".asp",
+    ".aspx",
+    ".jsp",
+    ".cgi",
+    ".htaccess",
+    ".bat",
+    ".cmd",
+    ".com",
+    ".msi",
+    ".sh",
+    ".bash",
+    ".ps1",
+    ".vbs",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".svg",
+    ".svgz"
+  ].map((e) => e.toLowerCase())
+);
+var BLOCKED_RAW = new Set(
+  [".dng", ".cr2", ".cr3", ".nef", ".arw", ".orf", ".rw2", ".raf", ".raw"].map((e) => e.toLowerCase())
+);
+var BLOCKED_MIME_PREFIXES = [
+  "text/html",
+  "application/xhtml",
+  "application/xml",
+  "text/xml",
+  "application/javascript",
+  "text/javascript",
+  "image/svg+xml",
+  "application/x-executable",
+  "application/x-sh"
+];
+var XML_XSS = [
+  /<script[\s>]/i,
+  /<\/script\s*>/i,
+  /\bon\w+\s*=/i,
+  /javascript\s*:/i,
+  /data\s*:\s*text\/html/i
+];
+function fileExt(filename) {
+  const name = filename.toLowerCase();
+  const i = name.lastIndexOf(".");
+  return i >= 0 ? name.slice(i) : "";
+}
+function blockedReason(filename, mime) {
+  const ext = fileExt(filename);
+  if (BLOCKED_EXTENSIONS.has(ext) || BLOCKED_RAW.has(ext)) return "file_type_blocked";
+  const m = (mime || "").toLowerCase();
+  for (const prefix of BLOCKED_MIME_PREFIXES) {
+    if (m.startsWith(prefix)) return "file_type_blocked";
   }
+  return null;
 }
-function isOwn(mid) {
-  return ownIds.has(mid);
+function sanitizeFilename(raw, fallback = "file.bin") {
+  const base = raw.replace(/\\/g, "/").split("/").pop()?.trim() || "";
+  const cleaned = base.replace(/[^\w.\- ()а-яА-ЯёЁ]+/g, "_").slice(0, 180);
+  if (!cleaned || cleaned === "." || cleaned === "..") return fallback;
+  return cleaned;
 }
+function inspectBridgeFile(file) {
+  if (!file.bytes.byteLength) return "empty_file";
+  if (file.bytes.byteLength > MAX_BRIDGE_FILE_BYTES) return "file_too_large";
+  const name = sanitizeFilename(file.filename);
+  const blocked = blockedReason(name, file.mime);
+  if (blocked) return blocked;
+  const head = Buffer.from(file.bytes.subarray(0, Math.min(file.bytes.byteLength, 1024 * 1024)));
+  const mime = (file.mime || "").toLowerCase();
+  if (mime === "application/pdf" || name.toLowerCase().endsWith(".pdf")) {
+    const raw = head.toString("binary");
+    if (raw.includes("/JS ") || raw.includes("/JavaScript ") || /\/S\s*\/JavaScript\b/.test(raw)) {
+      return "file_type_blocked";
+    }
+  }
+  const xmlHead = head.subarray(0, 2048).toString("utf8");
+  if (/<\?xml\s/i.test(xmlHead) || /<svg\s/i.test(xmlHead)) {
+    const text = head.toString("utf8");
+    for (const re of XML_XSS) {
+      if (re.test(text)) return "file_type_blocked";
+    }
+  }
+  return null;
+}
+function acceptFiles(files) {
+  const ok = [];
+  const skipped = [];
+  for (const file of files) {
+    const safe = {
+      ...file,
+      filename: sanitizeFilename(file.filename)
+    };
+    const reason = inspectBridgeFile(safe);
+    if (reason) {
+      skipped.push({ name: safe.filename, reason });
+      continue;
+    }
+    ok.push(safe);
+    if (ok.length >= MAX_FILES_PER_MESSAGE) break;
+  }
+  return { ok, skipped };
+}
+
+// src/bridge/media/record.ts
 function asRecord(v) {
   return v && typeof v === "object" ? v : {};
 }
-async function sendToTopic(settings, bind, route, text, signal) {
-  const out = asRecord(
-    await lcTopic(settings.baseUrl, bind.token, "/api/channels/send", "POST", { text }, signal)
-  );
-  const mid = out.messageId ? String(out.messageId) : null;
-  rememberOwn(mid);
-  if (mid) {
-    upsertRoute({
-      messageId: mid,
-      accountId: route.accountId,
-      messenger: route.messenger,
-      peerId: route.peerId,
-      userId: route.userId,
-      name: route.name,
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
-    });
+
+// src/bridge/media/lanchat.ts
+function absUrl(base, url) {
+  if (!url) return "";
+  if (/^https?:\/\//i.test(url)) return url;
+  return `${httpBase(base)}${url.startsWith("/") ? "" : "/"}${url}`;
+}
+async function filesFromLanchat(settings, message, extraToken, signal) {
+  const out = [];
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  for (const raw of attachments) {
+    const att = asRecord(raw);
+    const url = absUrl(settings.baseUrl, String(att.url ?? att.sourceUrl ?? ""));
+    if (!url) continue;
+    const file = await downloadLan(url, settings.lpat, extraToken, String(att.name ?? "file.bin"), String(att.mime ?? ""), signal);
+    if (file) out.push(file);
   }
-  return mid;
+  const sticker = asRecord(message.sticker);
+  const stickerUrl = absUrl(settings.baseUrl, String(sticker.sourceUrl ?? ""));
+  if (stickerUrl) {
+    const file = await downloadLan(stickerUrl, settings.lpat, extraToken, "sticker.webp", "image/webp", signal);
+    if (file) out.push(file);
+  }
+  return out;
 }
-function resolvedWsUrl(settings) {
-  return settings.wsUrl.trim() || defaultWsUrl(httpBase(settings.baseUrl));
-}
-async function handleStaffMessage(chatId, message, sendOutbound, signal) {
-  const mid = message.id ? String(message.id) : "";
-  if (!mid) return;
-  if (isOwn(mid)) return;
-  const replyTo = message.replyToMessageId ? String(message.replyToMessageId) : "";
-  if (getRoute(mid) && !replyTo) return;
-  const preview = asRecord(message.replyToPreview).text;
-  let route = replyTo ? getRoute(replyTo) : null;
-  if (!route && typeof preview === "string") {
-    const hint = parseMarker(preview);
-    if (hint) {
-      route = {
-        messageId: replyTo,
-        accountId: "",
-        messenger: hint.messenger,
-        peerId: hint.peerId,
-        userId: "",
-        name: "",
-        createdAt: (/* @__PURE__ */ new Date()).toISOString()
-      };
+async function downloadLan(url, lpat, extraToken, filename, mimeHint, signal) {
+  const tokens = [lpat, extraToken].filter((t) => Boolean(t));
+  let last = "";
+  for (const token of tokens.length ? tokens : [""]) {
+    try {
+      const headers = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
+      const { bytes, mime } = await fetchBytes(url, { headers, signal, timeoutMs: 9e4 });
+      return { filename, mime: mimeHint || mime, bytes };
+    } catch (e) {
+      last = String(e);
     }
   }
-  if (!route) {
-    if (replyTo) logBridge.warn("ws", `reply without route ${mid} \u2192 ${replyTo}`);
-    else logBridge.info("ws", `ignore non-reply in topic ${chatId} ${mid}`);
-    return;
-  }
-  const text = String(message.text ?? "");
-  try {
-    await sendOutbound(route, text, signal);
-    upsertRoute({ ...route, messageId: mid, createdAt: (/* @__PURE__ */ new Date()).toISOString() });
-    recordEvent({
-      direction: "out",
-      accountId: route.accountId || null,
-      messenger: route.messenger,
-      peerId: route.peerId,
-      preview: previewText(text),
-      lanMessageId: mid
-    });
-    logBridge.info("ws", `lan\u2192${route.messenger} ${route.peerId} ${mid}`, route.accountId || null);
-  } catch (e) {
-    logBridge.error("ws", `deliver fail ${String(e)}`, route.accountId || null);
-  }
+  if (last) throw new Error(last);
+  return null;
+}
+
+// src/bridge/clients.ts
+function asRecord2(v) {
+  return v && typeof v === "object" ? v : {};
 }
 async function vkApi(token, version, method, params, signal) {
-  const data = asRecord(
+  const data = asRecord2(
     await httpJson(`https://api.vk.com/method/${method}`, {
       method: "POST",
       form: true,
@@ -727,14 +864,14 @@ async function vkApi(token, version, method, params, signal) {
       signal
     })
   );
-  const err = asRecord(data.error);
+  const err = asRecord2(data.error);
   if (Object.keys(err).length) {
     throw new Error(`VK ${method}: [${err.error_code}] ${err.error_msg}`);
   }
   return data.response;
 }
 async function tgApi(token, method, params = {}, signal) {
-  const data = asRecord(
+  const data = asRecord2(
     await httpJson(`https://api.telegram.org/bot${token}/${method}`, {
       method: "POST",
       data: params,
@@ -759,39 +896,422 @@ async function maxApi(token, method, path3, opts = {}) {
     signal: opts.signal
   });
 }
-async function deliverOutbound(settings, account, route, text, signal) {
-  const body = text.trim() || "(\u043F\u0443\u0441\u0442\u043E)";
-  if (route.messenger === "vk") {
+
+// src/bridge/media/max.ts
+function pickUrl(payload) {
+  return String(
+    payload.url ?? payload.photo_url ?? asRecord(payload.photo).url ?? asRecord(payload.file).url ?? ""
+  );
+}
+async function filesFromMax(attachments, signal) {
+  if (!Array.isArray(attachments)) return [];
+  const out = [];
+  for (const raw of attachments) {
+    const att = asRecord(raw);
+    const payload = asRecord(att.payload);
+    const url = pickUrl(payload);
+    if (!url) continue;
+    const type = String(att.type ?? payload.type ?? "file");
+    try {
+      const { bytes, mime } = await fetchBytes(url, { signal, timeoutMs: 9e4 });
+      const filename = String(payload.filename ?? payload.name ?? payload.file_name ?? "") || defaultMaxName(type, mime);
+      out.push({ filename, mime: String(payload.mime ?? mime), bytes });
+    } catch {
+    }
+  }
+  return out;
+}
+function defaultMaxName(type, mime) {
+  if (type === "image" || mime.startsWith("image/")) return "image.jpg";
+  if (type === "video" || mime.startsWith("video/")) return "video.mp4";
+  if (type === "audio" || mime.startsWith("audio/")) return "audio.mp3";
+  return "file.bin";
+}
+function maxUploadType(file) {
+  const mime = (file.mime || "").toLowerCase();
+  if (mime.startsWith("image/") && !mime.includes("svg")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return "file";
+}
+async function sendMaxFiles(token, peerId, text, files, signal) {
+  const attachments = [];
+  for (const file of files) {
+    const type = maxUploadType(file);
+    const prepared = asRecord(
+      await maxApi(token, "POST", "/uploads", { query: { type }, signal, timeoutMs: 4e4 })
+    );
+    const uploadUrl = String(prepared.url ?? "");
+    if (!uploadUrl) throw new Error("Max /uploads: no url");
+    const form = new FormData();
+    form.append("data", new Blob([file.bytes], { type: file.mime }), file.filename);
+    const uploaded = asRecord(await postFormJson(uploadUrl, form, { signal, timeoutMs: 12e4 }));
+    const tokenVal = String(uploaded.token ?? prepared.token ?? asRecord(uploaded.payload).token ?? "");
+    if (!tokenVal) throw new Error("Max upload: no token");
+    attachments.push({ type, payload: { token: tokenVal } });
+  }
+  const body = { text: text.trim() || (attachments.length ? "" : "(\u043F\u0443\u0441\u0442\u043E)") };
+  if (attachments.length) body.attachments = attachments;
+  await sendMaxWithRetry(token, peerId, body, signal);
+}
+async function sendMaxWithRetry(token, peerId, body, signal) {
+  let delay = 800;
+  for (let i = 0; i < 5; i++) {
+    try {
+      await maxApi(token, "POST", "/messages", {
+        query: { chat_id: Number(peerId) },
+        data: body,
+        signal,
+        timeoutMs: 4e4
+      });
+      return;
+    } catch (e) {
+      const msg = String(e);
+      if (!msg.includes("attachment.not.ready") && !msg.includes("not.processed")) throw e;
+      await new Promise((r) => setTimeout(r, delay));
+      delay *= 2;
+    }
+  }
+  throw new Error("Max attachment not ready");
+}
+
+// src/bridge/media/telegram.ts
+var TG_MEDIA = ["photo", "document", "video", "audio", "voice", "video_note", "sticker", "animation"];
+async function filesFromTelegram(token, message, signal) {
+  const out = [];
+  for (const key of TG_MEDIA) {
+    const part = message[key];
+    if (!part) continue;
+    if (key === "photo" && Array.isArray(part)) {
+      const last = part[part.length - 1];
+      const file2 = await downloadTgFile(token, asRecord(last), "photo.jpg", "image/jpeg", signal);
+      if (file2) out.push(file2);
+      continue;
+    }
+    const rec = asRecord(part);
+    const name = String(rec.file_name ?? rec.file_unique_id ?? key);
+    const mime = String(rec.mime_type ?? "") || (key === "sticker" ? "image/webp" : key === "voice" ? "audio/ogg" : "application/octet-stream");
+    const file = await downloadTgFile(token, rec, name, mime, signal);
+    if (file) out.push(file);
+  }
+  return out;
+}
+async function downloadTgFile(token, rec, fallbackName, fallbackMime, signal) {
+  const fileId = String(rec.file_id ?? "");
+  if (!fileId) return null;
+  const data = asRecord(
+    await httpJson(`https://api.telegram.org/bot${token}/getFile`, {
+      method: "POST",
+      data: { file_id: fileId },
+      signal,
+      timeoutMs: 4e4
+    })
+  );
+  if (!data.ok) throw new Error(`TG getFile: ${JSON.stringify(data).slice(0, 200)}`);
+  const meta = asRecord(data.result);
+  const path3 = String(meta.file_path ?? "");
+  if (!path3) return null;
+  const { bytes, mime } = await fetchBytes(`https://api.telegram.org/file/bot${token}/${path3}`, {
+    signal,
+    timeoutMs: 9e4
+  });
+  return {
+    filename: String(rec.file_name ?? fallbackName),
+    mime: String(rec.mime_type ?? mime ?? fallbackMime),
+    bytes
+  };
+}
+async function sendTelegramFiles(token, peerId, text, files, signal) {
+  const caption = text.trim().slice(0, 1024);
+  if (files.length === 0) {
+    await httpJson(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      data: { chat_id: Number(peerId), text: text.trim() || "(\u043F\u0443\u0441\u0442\u043E)" },
+      signal
+    });
+    return;
+  }
+  let first = true;
+  for (const file of files) {
+    const form = new FormData();
+    form.append("chat_id", peerId);
+    const kind = tgSendKind(file);
+    form.append(kind, new Blob([file.bytes], { type: file.mime || "application/octet-stream" }), file.filename);
+    if (first && caption) form.append("caption", caption);
+    first = false;
+    const method = kind === "photo" ? "sendPhoto" : kind === "video" ? "sendVideo" : kind === "audio" ? "sendAudio" : "sendDocument";
+    const data = asRecord(
+      await postFormJson(`https://api.telegram.org/bot${token}/${method}`, form, {
+        signal,
+        timeoutMs: 12e4
+      })
+    );
+    if (data.ok === false) {
+      throw new Error(`TG ${method}: ${JSON.stringify(data).slice(0, 240)}`);
+    }
+  }
+}
+function tgSendKind(file) {
+  const mime = (file.mime || "").toLowerCase();
+  const name = file.filename.toLowerCase();
+  if (mime.startsWith("image/") && !name.endsWith(".webp")) return "photo";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  return "document";
+}
+
+// src/bridge/media/vk.ts
+function largestVkUrl(photo) {
+  const sizes = Array.isArray(photo.sizes) ? photo.sizes : [];
+  let best = "";
+  let area = 0;
+  for (const raw of sizes) {
+    const s = asRecord(raw);
+    const a = Number(s.width ?? 0) * Number(s.height ?? 0);
+    const url = String(s.url ?? "");
+    if (url && a >= area) {
+      area = a;
+      best = url;
+    }
+  }
+  return best || String(photo.url ?? "");
+}
+async function filesFromVk(attachments, signal) {
+  if (!Array.isArray(attachments)) return [];
+  const out = [];
+  for (const raw of attachments) {
+    const att = asRecord(raw);
+    const type = String(att.type ?? "");
+    try {
+      if (type === "photo") {
+        const photo = asRecord(att.photo);
+        const url = largestVkUrl(photo);
+        if (!url) continue;
+        const { bytes, mime } = await fetchBytes(url, { signal, timeoutMs: 9e4 });
+        out.push({ filename: `photo_${photo.id ?? "vk"}.jpg`, mime: mime || "image/jpeg", bytes });
+      } else if (type === "doc") {
+        const doc = asRecord(att.doc);
+        const url = String(doc.url ?? "");
+        if (!url) continue;
+        const { bytes, mime } = await fetchBytes(url, { signal, timeoutMs: 9e4 });
+        const title = String(doc.title ?? "file");
+        const ext = String(doc.ext ?? "");
+        const filename = ext && !title.toLowerCase().endsWith(`.${ext.toLowerCase()}`) ? `${title}.${ext}` : title;
+        out.push({ filename, mime: mime || "application/octet-stream", bytes });
+      } else if (type === "audio" || type === "audio_message") {
+        const audio = asRecord(att.audio ?? att.audio_message ?? att);
+        const url = String(audio.link_ogg ?? audio.link_mp3 ?? audio.url ?? "");
+        if (!url) continue;
+        const { bytes, mime } = await fetchBytes(url, { signal, timeoutMs: 9e4 });
+        out.push({ filename: type === "audio_message" ? "voice.ogg" : "audio.mp3", mime, bytes });
+      } else if (type === "graffiti" || type === "sticker") {
+        const obj = asRecord(att[type] ?? att);
+        const url = String(obj.url ?? asRecord(obj.images).url ?? "");
+        if (!url) continue;
+        const { bytes, mime } = await fetchBytes(url, { signal });
+        out.push({ filename: `${type}.png`, mime: mime || "image/png", bytes });
+      }
+    } catch {
+    }
+  }
+  return out;
+}
+async function sendVkFiles(account, settings, peerId, text, files, signal) {
+  const peer = Number(peerId);
+  const attachmentIds = [];
+  for (const file of files) {
+    const mime = (file.mime || "").toLowerCase();
+    if (mime.startsWith("image/") && !mime.includes("webp")) {
+      attachmentIds.push(await uploadVkPhoto(account, settings, peer, file, signal));
+    } else {
+      attachmentIds.push(await uploadVkDoc(account, settings, peer, file, signal));
+    }
+  }
+  await vkApi(
+    account.token,
+    settings.vkApiVersion,
+    "messages.send",
+    {
+      peer_id: peer,
+      random_id: Math.floor(Math.random() * 2e9) + 1,
+      message: text.trim() || (attachmentIds.length ? "" : "(\u043F\u0443\u0441\u0442\u043E)"),
+      attachment: attachmentIds.join(",") || void 0
+    },
+    signal
+  );
+}
+async function uploadVkPhoto(account, settings, peer, file, signal) {
+  const server = asRecord(
     await vkApi(
       account.token,
       settings.vkApiVersion,
-      "messages.send",
-      {
-        peer_id: Number(route.peerId),
-        random_id: randomInt(1, 2e9),
-        message: body
-      },
+      "photos.getMessagesUploadServer",
+      { peer_id: peer },
       signal
-    );
+    )
+  );
+  const uploadUrl = String(server.upload_url ?? "");
+  const form = new FormData();
+  form.append("photo", new Blob([file.bytes], { type: file.mime }), file.filename);
+  const uploaded = asRecord(await postFormJson(uploadUrl, form, { signal, timeoutMs: 12e4 }));
+  const saved = await vkApi(
+    account.token,
+    settings.vkApiVersion,
+    "photos.saveMessagesPhoto",
+    { photo: uploaded.photo, server: uploaded.server, hash: uploaded.hash },
+    signal
+  );
+  const photo = asRecord(saved?.[0]);
+  return `photo${photo.owner_id}_${photo.id}`;
+}
+async function uploadVkDoc(account, settings, peer, file, signal) {
+  const server = asRecord(
+    await vkApi(
+      account.token,
+      settings.vkApiVersion,
+      "docs.getMessagesUploadServer",
+      { peer_id: peer, type: "doc" },
+      signal
+    )
+  );
+  const uploadUrl = String(server.upload_url ?? "");
+  const form = new FormData();
+  form.append("file", new Blob([file.bytes], { type: file.mime }), file.filename);
+  const uploaded = asRecord(await postFormJson(uploadUrl, form, { signal, timeoutMs: 12e4 }));
+  const saved = asRecord(
+    await vkApi(
+      account.token,
+      settings.vkApiVersion,
+      "docs.save",
+      { file: uploaded.file, title: file.filename },
+      signal
+    )
+  );
+  const doc = asRecord(saved.doc ?? saved);
+  return `doc${doc.owner_id}_${doc.id}`;
+}
+
+// src/bridge/dispatch.ts
+var ownIds = /* @__PURE__ */ new Set();
+var ownOrder = [];
+function rememberOwn(mid) {
+  if (!mid) return;
+  if (ownIds.has(mid)) return;
+  ownIds.add(mid);
+  ownOrder.push(mid);
+  while (ownOrder.length > 8e3) {
+    const old = ownOrder.shift();
+    if (old) ownIds.delete(old);
+  }
+}
+function isOwn(mid) {
+  return ownIds.has(mid);
+}
+function asRecord3(v) {
+  return v && typeof v === "object" ? v : {};
+}
+async function sendToTopic(settings, bind, route, text, files = [], signal) {
+  const gated = acceptFiles(files);
+  for (const skip of gated.skipped) {
+    logBridge.warn("media", `drop ${skip.name}: ${skip.reason}`, route.accountId);
+  }
+  const out = asRecord3(
+    await lcTopicSend(settings.baseUrl, bind.token, text, gated.ok, signal)
+  );
+  const mid = out.messageId ? String(out.messageId) : null;
+  rememberOwn(mid);
+  if (mid) {
+    upsertRoute({
+      messageId: mid,
+      accountId: route.accountId,
+      messenger: route.messenger,
+      peerId: route.peerId,
+      userId: route.userId,
+      name: route.name,
+      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+    });
+  }
+  return mid;
+}
+function resolvedWsUrl(settings) {
+  return settings.wsUrl.trim() || defaultWsUrl(httpBase(settings.baseUrl));
+}
+async function handleStaffMessage(settings, chatId, message, sendOutbound, signal) {
+  const mid = message.id ? String(message.id) : "";
+  if (!mid) return;
+  if (isOwn(mid)) return;
+  const replyTo = message.replyToMessageId ? String(message.replyToMessageId) : "";
+  if (getRoute(mid) && !replyTo) return;
+  const preview = asRecord3(message.replyToPreview).text;
+  let route = replyTo ? getRoute(replyTo) : null;
+  if (!route && typeof preview === "string") {
+    const hint = parseMarker(preview);
+    if (hint) {
+      route = {
+        messageId: replyTo,
+        accountId: "",
+        messenger: hint.messenger,
+        peerId: hint.peerId,
+        userId: "",
+        name: "",
+        createdAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+    }
+  }
+  if (!route) {
+    if (replyTo) logBridge.warn("ws", `reply without route ${mid} \u2192 ${replyTo}`);
+    else logBridge.info("ws", `ignore non-reply in topic ${chatId} ${mid}`);
+    return;
+  }
+  const text = String(message.text ?? "");
+  let files = [];
+  try {
+    files = await filesFromLanchat(settings, message, void 0, signal);
+  } catch (e) {
+    logBridge.warn("media", `lan download ${String(e)}`);
+  }
+  const gated = acceptFiles(files);
+  for (const skip of gated.skipped) {
+    logBridge.warn("media", `drop lan ${skip.name}: ${skip.reason}`, route.accountId);
+  }
+  try {
+    await sendOutbound(route, { text, files: gated.ok }, signal);
+    upsertRoute({ ...route, messageId: mid, createdAt: (/* @__PURE__ */ new Date()).toISOString() });
+    recordEvent({
+      direction: "out",
+      accountId: route.accountId || null,
+      messenger: route.messenger,
+      peerId: route.peerId,
+      preview: previewText(text) || (gated.ok.length ? `(\u0444\u0430\u0439\u043B \xD7${gated.ok.length})` : ""),
+      lanMessageId: mid
+    });
+    logBridge.info("ws", `lan\u2192${route.messenger} ${route.peerId} ${mid}`, route.accountId || null);
+  } catch (e) {
+    logBridge.error("ws", `deliver fail ${String(e)}`, route.accountId || null);
+  }
+}
+async function deliverOutbound(settings, account, route, text, files = [], signal) {
+  const gated = acceptFiles(files);
+  for (const skip of gated.skipped) {
+    logBridge.warn("media", `drop out ${skip.name}: ${skip.reason}`, account.id);
+  }
+  if (route.messenger === "vk") {
+    await sendVkFiles(account, settings, route.peerId, text, gated.ok, signal);
     return;
   }
   if (route.messenger === "tg") {
-    await tgApi(account.token, "sendMessage", { chat_id: Number(route.peerId), text: body }, signal);
+    await sendTelegramFiles(account.token, route.peerId, text, gated.ok, signal);
     return;
   }
   if (route.messenger === "max") {
-    await maxApi(account.token, "POST", "/messages", {
-      query: { chat_id: Number(route.peerId) },
-      data: { text: body },
-      signal
-    });
+    await sendMaxFiles(account.token, route.peerId, text, gated.ok, signal);
     return;
   }
   throw new Error(`unknown messenger ${route.messenger}`);
 }
 
 // src/bridge/telegram.ts
-function asRecord2(v) {
+function asRecord4(v) {
   return v && typeof v === "object" ? v : {};
 }
 async function telegramLoop(settings, account, bind, signal) {
@@ -806,22 +1326,25 @@ async function telegramLoop(settings, account, bind, signal) {
         signal
       );
       for (const raw of updates ?? []) {
-        const u = asRecord2(raw);
+        const u = asRecord4(raw);
         offset = Math.max(offset, Number(u.update_id ?? 0) + 1);
-        const m = asRecord2(u.message);
-        const chat = asRecord2(m.chat);
+        const m = asRecord4(u.message);
+        const chat = asRecord4(m.chat);
         if (!chat.id) continue;
         const chatId = String(chat.id);
-        const fromU = asRecord2(m.from);
+        const fromU = asRecord4(m.from);
         if (fromU.is_bot) continue;
         const uid = String(fromU.id ?? "");
         const uname = fromU.username ? `@${fromU.username}` : "";
         const name = [fromU.first_name, fromU.last_name].filter(Boolean).join(" ").trim() || uname || uid;
-        let nAtt = 0;
-        for (const k of ["photo", "document", "video", "audio", "voice", "sticker", "animation"]) {
-          if (m[k]) nAtt += 1;
-        }
         const inbound = telegramInboundText(String(m.text ?? m.caption ?? ""));
+        let files = [];
+        try {
+          files = await filesFromTelegram(account.token, m, signal);
+        } catch (e) {
+          logBridge.warn("tg", `files ${String(e)}`, account.id);
+        }
+        const nAtt = files.length;
         const text = formatInbound({
           messenger: "tg",
           name,
@@ -836,6 +1359,7 @@ async function telegramLoop(settings, account, bind, signal) {
           bind,
           { accountId: account.id, messenger: "tg", peerId: chatId, userId: uid, name },
           text,
+          files,
           signal
         );
         recordEvent({
@@ -870,7 +1394,7 @@ function sleep(ms, signal) {
 }
 
 // src/bridge/max.ts
-function asRecord3(v) {
+function asRecord5(v) {
   return v && typeof v === "object" ? v : {};
 }
 function displayName(user) {
@@ -882,13 +1406,15 @@ function displayName(user) {
 async function ingest(settings, account, bind, input, signal) {
   if (!input.peerId) return;
   const inbound = botStartInboundText(input.text, input.started);
+  const files = input.files ?? [];
+  const nAtt = files.length || input.nAtt;
   const text = formatInbound({
     messenger: "max",
     name: input.name,
     userKey: input.uname || input.uid,
     peerId: input.peerId,
     text: inbound,
-    nAtt: input.nAtt,
+    nAtt,
     source: account.label || "Max"
   });
   const mid = await sendToTopic(
@@ -902,6 +1428,7 @@ async function ingest(settings, account, bind, input, signal) {
       name: input.name
     },
     text,
+    files,
     signal
   );
   recordEvent({
@@ -915,10 +1442,10 @@ async function ingest(settings, account, bind, input, signal) {
   logBridge.info("max", `max\u2192lan ${input.peerId} ${mid ?? ""}`, account.id);
 }
 async function handleUpdate(settings, account, bind, raw, signal) {
-  const u = asRecord3(raw);
+  const u = asRecord5(raw);
   const type = String(u.update_type ?? u.type ?? "");
   if (type === "bot_started") {
-    const user2 = displayName(asRecord3(u.user));
+    const user2 = displayName(asRecord5(u.user));
     const peerId2 = String(u.chat_id ?? user2.uid);
     await ingest(
       settings,
@@ -930,14 +1457,20 @@ async function handleUpdate(settings, account, bind, raw, signal) {
     return;
   }
   if (type !== "message_created") return;
-  const message = asRecord3(u.message);
-  const sender = asRecord3(message.sender ?? message.from);
+  const message = asRecord5(u.message);
+  const sender = asRecord5(message.sender ?? message.from);
   if (sender.is_bot) return;
   const user = displayName(sender);
-  const recipient = asRecord3(message.recipient);
+  const recipient = asRecord5(message.recipient);
   const peerId = String(recipient.chat_id ?? message.chat_id ?? u.chat_id ?? recipient.user_id ?? "");
-  const body = asRecord3(message.body);
+  const body = asRecord5(message.body);
   const attachments = Array.isArray(body.attachments) ? body.attachments : Array.isArray(message.attachments) ? message.attachments : [];
+  let files = [];
+  try {
+    files = await filesFromMax(attachments, signal);
+  } catch (e) {
+    logBridge.warn("max", `files ${String(e)}`, account.id);
+  }
   await ingest(
     settings,
     account,
@@ -946,7 +1479,8 @@ async function handleUpdate(settings, account, bind, raw, signal) {
       peerId,
       ...user,
       text: String(body.text ?? message.text ?? ""),
-      nAtt: attachments.length
+      nAtt: files.length || attachments.length,
+      files
     },
     signal
   );
@@ -956,7 +1490,7 @@ async function maxLoop(settings, account, bind, signal) {
   logBridge.info("max", "polling", account.id);
   while (!signal.aborted) {
     try {
-      const page = asRecord3(
+      const page = asRecord5(
         await maxApi(account.token, "GET", "/updates", {
           query: {
             limit: 100,
@@ -1002,19 +1536,19 @@ function sleep2(ms, signal) {
 }
 
 // src/bridge/topics.ts
-function asRecord4(v) {
+function asRecord6(v) {
   return v && typeof v === "object" ? v : {};
 }
 async function listTopics(settings, signal) {
   const lc = lanFromSettings(settings);
   const listed = await lcUser(lc, `/api/public/chats/${settings.parentChatId}/topics`, "GET", void 0, signal);
-  const rec = asRecord4(listed);
+  const rec = asRecord6(listed);
   const items = Array.isArray(rec.topics) ? rec.topics : listed;
-  return Array.isArray(items) ? items.map(asRecord4) : [];
+  return Array.isArray(items) ? items.map(asRecord6) : [];
 }
 async function topicToken(settings, topicId, signal) {
   const lc = lanFromSettings(settings);
-  const tok = asRecord4(
+  const tok = asRecord6(
     await lcUser(
       lc,
       `/api/public/chats/${settings.parentChatId}/topics/${topicId}/channel-token`,
@@ -1028,11 +1562,11 @@ async function topicToken(settings, topicId, signal) {
   return token;
 }
 async function chatIdFromChannelToken(settings, token, signal) {
-  const data = asRecord4(
+  const data = asRecord6(
     await lcTopic(settings.baseUrl, token, "/api/channels/messages?limit=1", "GET", void 0, signal)
   );
   const msgs = Array.isArray(data.messages) ? data.messages : [];
-  const first = asRecord4(msgs[0]);
+  const first = asRecord6(msgs[0]);
   const chatId = String(first.chatId ?? "");
   if (!chatId) throw new Error("channel token has no messages to infer chatId");
   return chatId;
@@ -1075,7 +1609,7 @@ async function ensureTopic(settings, account, signal) {
   const items = await listTopics(settings, signal);
   let found = items.find((t) => String(t.title ?? "").trim().toLowerCase() === title.toLowerCase()) ?? null;
   if (!found) {
-    const created = asRecord4(
+    const created = asRecord6(
       await lcUser(
         lanFromSettings(settings),
         `/api/public/chats/${settings.parentChatId}/topics`,
@@ -1103,7 +1637,7 @@ function persistTopic(accountId, token, chatId, title) {
 }
 
 // src/bridge/vk.ts
-function asRecord5(v) {
+function asRecord7(v) {
   return v && typeof v === "object" ? v : {};
 }
 function vkLpUrl(server) {
@@ -1114,12 +1648,12 @@ function vkLpUrl(server) {
 async function refreshLongPoll(account, settings, signal) {
   const gid = Number(account.groupId);
   try {
-    const lp = asRecord5(
+    const lp = asRecord7(
       await vkApi(account.token, settings.vkApiVersion, "groups.getLongPollServer", { group_id: gid }, signal)
     );
     return { server: String(lp.server ?? ""), key: String(lp.key ?? ""), ts: String(lp.ts ?? "") };
   } catch {
-    const lp = asRecord5(
+    const lp = asRecord7(
       await vkApi(
         account.token,
         settings.vkApiVersion,
@@ -1133,7 +1667,7 @@ async function refreshLongPoll(account, settings, signal) {
 }
 async function fetchMessage(account, settings, messageId, signal) {
   try {
-    const data = asRecord5(
+    const data = asRecord7(
       await vkApi(
         account.token,
         settings.vkApiVersion,
@@ -1143,7 +1677,7 @@ async function fetchMessage(account, settings, messageId, signal) {
       )
     );
     const items = Array.isArray(data.items) ? data.items : [];
-    return items[0] ? asRecord5(items[0]) : null;
+    return items[0] ? asRecord7(items[0]) : null;
   } catch (e) {
     logBridge.warn("vk", `getById ${messageId} ${String(e)}`, account.id);
     return null;
@@ -1154,7 +1688,7 @@ async function groupTitle(account, settings, signal) {
   const cached = groupTitleCache.get(account.id);
   if (cached) return cached;
   try {
-    const data = asRecord5(
+    const data = asRecord7(
       await vkApi(
         account.token,
         settings.vkApiVersion,
@@ -1164,7 +1698,7 @@ async function groupTitle(account, settings, signal) {
       )
     );
     const groups = Array.isArray(data.groups) ? data.groups : Array.isArray(data) ? data : [];
-    const name = String(asRecord5(groups[0]).name ?? "").trim();
+    const name = String(asRecord7(groups[0]).name ?? "").trim();
     const title = name || account.label || "VK";
     groupTitleCache.set(account.id, title);
     return title;
@@ -1185,7 +1719,7 @@ async function displayName2(account, settings, fromId, signal) {
       { user_ids: fromId },
       signal
     );
-    const u = asRecord5(users?.[0]);
+    const u = asRecord7(users?.[0]);
     const name = `${u.first_name ?? ""} ${u.last_name ?? ""}`.trim();
     return name || fromId;
   } catch {
@@ -1198,7 +1732,14 @@ async function ingest2(settings, account, bind, m, signal) {
   const fromId = String(m.from_id ?? "");
   if (!peer) return;
   const name = fromId ? await displayName2(account, settings, fromId, signal) : peer;
-  const nAtt = Array.isArray(m.attachments) ? m.attachments.length : 0;
+  const nAttListed = Array.isArray(m.attachments) ? m.attachments.length : 0;
+  let files = [];
+  try {
+    files = await filesFromVk(m.attachments, signal);
+  } catch (e) {
+    logBridge.warn("vk", `files ${String(e)}`, account.id);
+  }
+  const nAtt = files.length || nAttListed;
   const source = await groupTitle(account, settings, signal);
   const text = formatInbound({
     messenger: "vk",
@@ -1220,6 +1761,7 @@ async function ingest2(settings, account, bind, m, signal) {
       name
     },
     text,
+    files,
     signal
   );
   recordEvent({
@@ -1234,9 +1776,9 @@ async function ingest2(settings, account, bind, m, signal) {
 }
 async function handleUpdate2(settings, account, bind, u, signal) {
   if (u && typeof u === "object" && !Array.isArray(u)) {
-    const rec = asRecord5(u);
+    const rec = asRecord7(u);
     if (rec.type !== "message_new") return;
-    await ingest2(settings, account, bind, asRecord5(asRecord5(rec.object).message), signal);
+    await ingest2(settings, account, bind, asRecord7(asRecord7(rec.object).message), signal);
     return;
   }
   if (!Array.isArray(u) || u.length === 0) return;
@@ -1248,7 +1790,7 @@ async function handleUpdate2(settings, account, bind, u, signal) {
     await ingest2(settings, account, bind, full, signal);
     return;
   }
-  const extra = u[6] && typeof u[6] === "object" ? asRecord5(u[6]) : {};
+  const extra = u[6] && typeof u[6] === "object" ? asRecord7(u[6]) : {};
   const peer = String(u[3] ?? "");
   const fromId = String(extra.from || peer);
   await ingest2(
@@ -1273,7 +1815,7 @@ async function vkLoop(settings, account, bind, signal) {
         mode: "2",
         version: "3"
       });
-      const data = asRecord5(await httpJson(`${vkLpUrl(lp.server)}?${q}`, { timeoutMs: 35e3, signal }));
+      const data = asRecord7(await httpJson(`${vkLpUrl(lp.server)}?${q}`, { timeoutMs: 35e3, signal }));
       if (data.failed) {
         if (Number(data.failed) === 1 && data.ts) {
           lp = { ...lp, ts: String(data.ts) };
@@ -1561,12 +2103,13 @@ var BridgeManager = class {
       () => this.topicIds(),
       async (chatId, message) => {
         await handleStaffMessage(
+          normalizedSettings(),
           chatId,
           message,
-          async (route, text, sig) => {
+          async (route, payload, sig) => {
             const account = this.accountForRoute(route) ?? this.accountForChat(chatId);
             if (!account) throw new Error("no account for outbound route");
-            await deliverOutbound(normalizedSettings(), account, route, text, sig);
+            await deliverOutbound(normalizedSettings(), account, route, payload.text, payload.files, sig);
           },
           signal
         );

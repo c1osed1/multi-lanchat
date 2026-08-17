@@ -648,9 +648,6 @@ function rememberOwn(mid) {
 function isOwn(mid) {
   return ownIds.has(mid);
 }
-function forgetOwn(mid) {
-  ownIds.delete(mid);
-}
 function asRecord(v) {
   return v && typeof v === "object" ? v : {};
 }
@@ -672,32 +669,6 @@ async function sendToTopic(settings, bind, route, text, signal) {
     });
   }
   return mid;
-}
-async function drainTopicQueue(settings, bind, signal) {
-  while (!signal?.aborted) {
-    const data = asRecord(
-      await lcTopic(settings.baseUrl, bind.token, "/api/channels/next", "GET", void 0, signal)
-    );
-    const msg = asRecord(data.message);
-    if (!msg.id) return;
-    const mid = String(msg.id);
-    const own = isOwn(mid);
-    if (own) forgetOwn(mid);
-    try {
-      await lcTopic(
-        settings.baseUrl,
-        bind.token,
-        "/api/channels/read",
-        "POST",
-        { messageId: mid, status: true },
-        signal
-      );
-      if (own) logBridge.info("queue", `ack own ${bind.key} ${mid}`, bind.accountId);
-    } catch (e) {
-      logBridge.warn("queue", `ack fail ${String(e)}`, bind.accountId);
-      return;
-    }
-  }
 }
 function resolvedWsUrl(settings) {
   return settings.wsUrl.trim() || defaultWsUrl(httpBase(settings.baseUrl));
@@ -1490,19 +1461,6 @@ function sleep4(ms) {
 }
 
 // src/bridge/manager.ts
-function sleep5(ms, signal) {
-  return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(t);
-        resolve();
-      },
-      { once: true }
-    );
-  });
-}
 var BridgeManager = class {
   abort = null;
   socket = null;
@@ -1616,7 +1574,6 @@ var BridgeManager = class {
       () => this.publishStatus()
     );
     this.socket.start();
-    void this.queueLoop(settings, signal);
     for (const account of enabled) {
       const bind = this.binds.get(account.id);
       if (!bind) continue;
@@ -1647,21 +1604,6 @@ var BridgeManager = class {
       return;
     }
     await this.restart();
-  }
-  async queueLoop(settings, signal) {
-    while (!signal.aborted) {
-      for (const bind of this.binds.values()) {
-        if (signal.aborted) return;
-        try {
-          await drainTopicQueue(normalizedSettings(), bind, signal);
-        } catch (e) {
-          if (signal.aborted) return;
-          logBridge.warn("queue", `${bind.key} ${String(e)}`, bind.accountId);
-          await sleep5(2e3, signal);
-        }
-      }
-      await sleep5(Math.round(settings.pollEmptySec * 1e3), signal);
-    }
   }
   async accountLoop(account, bind, signal) {
     const settings = normalizedSettings();

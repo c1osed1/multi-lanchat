@@ -1,5 +1,5 @@
 // src/index.ts
-import fs3 from "node:fs";
+import fs5 from "node:fs";
 import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 
@@ -38,9 +38,10 @@ var DB_PATH = path.join(DATA_DIR, "bridge.sqlite");
 var WEB_DIST = path.join(ROOT_DIR, "web/dist");
 var BRIDGE_UI_TOKEN = readEnv("BRIDGE_UI_TOKEN");
 
-// src/api/handlers.ts
-import { randomUUID } from "node:crypto";
-import { z as z2 } from "zod";
+// src/update/service.ts
+import fs4 from "node:fs";
+import path4 from "node:path";
+import { spawn } from "node:child_process";
 
 // src/db/repo.ts
 import fs2 from "node:fs";
@@ -617,6 +618,269 @@ data: ${redactSecrets(body)}
   }
 }
 
+// src/bridge/logger.ts
+var logBridge = {
+  write(level, source, message, accountId) {
+    const row = insertLog({
+      level,
+      source,
+      accountId,
+      message: redactSecrets(message)
+    });
+    broadcastLive({ event: "log", data: row });
+    const line = `${row.ts} [${level}] ${source}${accountId ? `:${accountId.slice(0, 8)}` : ""} ${row.message}`;
+    if (level === "error") console.error(line);
+    else if (level === "warn") console.warn(line);
+    else console.log(line);
+  },
+  info(source, message, accountId) {
+    this.write("info", source, message, accountId);
+  },
+  warn(source, message, accountId) {
+    this.write("warn", source, message, accountId);
+  },
+  error(source, message, accountId) {
+    this.write("error", source, message, accountId);
+  }
+};
+function recordEvent(input) {
+  const row = insertEvent(input);
+  broadcastLive({ event: "bridge-event", data: row });
+}
+
+// src/update/git.ts
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+var execFileAsync = promisify(execFile);
+async function run(rootDir, args) {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd: rootDir,
+    windowsHide: true
+  });
+  return stdout.trim();
+}
+async function isGitAvailable() {
+  try {
+    await execFileAsync("git", ["--version"], { windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function isGitRepo(rootDir) {
+  try {
+    return await run(rootDir, ["rev-parse", "--is-inside-work-tree"]) === "true";
+  } catch {
+    return false;
+  }
+}
+async function getHeadCommit(rootDir) {
+  try {
+    return await run(rootDir, ["rev-parse", "HEAD"]);
+  } catch {
+    return null;
+  }
+}
+async function getUpstreamBranch(rootDir) {
+  try {
+    return await run(rootDir, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+  } catch {
+    return null;
+  }
+}
+async function isWorktreeClean(rootDir) {
+  try {
+    return await run(rootDir, ["status", "--porcelain", "--untracked-files=no"]) === "";
+  } catch {
+    return false;
+  }
+}
+async function getRemoteBranchHead(rootDir, branch) {
+  const remoteBranch = branch.includes("/") ? branch : `origin/${branch}`;
+  const shortBranch = remoteBranch.startsWith("origin/") ? remoteBranch.slice("origin/".length) : branch;
+  try {
+    const line = await run(rootDir, ["ls-remote", "--heads", "origin", shortBranch]);
+    const sha = line.split(/\s+/)[0]?.trim();
+    return sha || null;
+  } catch {
+    return null;
+  }
+}
+
+// src/update/runtime.ts
+import fs3 from "node:fs";
+import path3 from "node:path";
+var UPDATE_STATE_PATH = path3.join(DATA_DIR, "update-state.json");
+var MANAGED_STATE_PATH = path3.join(DATA_DIR, "managed-process.json");
+var MANAGED_COMMAND_PATH = path3.join(DATA_DIR, "managed-command.json");
+var IDLE_PROGRESS = {
+  status: "idle",
+  step: "idle",
+  message: "",
+  startedAt: null,
+  finishedAt: null,
+  error: null
+};
+function ensureDataDir() {
+  fs3.mkdirSync(DATA_DIR, { recursive: true });
+}
+function readJson(file) {
+  try {
+    if (!fs3.existsSync(file)) return null;
+    return JSON.parse(fs3.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function writeJson(file, value) {
+  ensureDataDir();
+  const tmp = `${file}.tmp`;
+  fs3.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}
+`, "utf8");
+  fs3.renameSync(tmp, file);
+}
+function defaultUpdateProgress() {
+  return { ...IDLE_PROGRESS };
+}
+function readUpdateProgress() {
+  return readJson(UPDATE_STATE_PATH) ?? defaultUpdateProgress();
+}
+function writeUpdateProgress(progress) {
+  writeJson(UPDATE_STATE_PATH, progress);
+}
+function readManagedState() {
+  return readJson(MANAGED_STATE_PATH);
+}
+
+// src/update/service.ts
+function hasRemoteUpdate(currentCommit, remoteCommit) {
+  return Boolean(currentCommit && remoteCommit && currentCommit !== remoteCommit);
+}
+function getSupportReason(input) {
+  if (!input.gitAvailable) return "Git \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D \u0432 \u0441\u0438\u0441\u0442\u0435\u043C\u0435";
+  if (!input.gitRepo) return "\u0423\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 \u043D\u0435 \u044F\u0432\u043B\u044F\u0435\u0442\u0441\u044F git-\u043A\u043B\u043E\u043D\u043E\u043C";
+  if (!input.cleanWorktree) return "\u0410\u0432\u0442\u043E\u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 \u043E\u0442\u043A\u043B\u044E\u0447\u0435\u043D\u043E: \u0435\u0441\u0442\u044C \u043B\u043E\u043A\u0430\u043B\u044C\u043D\u044B\u0435 \u0438\u0437\u043C\u0435\u043D\u0435\u043D\u0438\u044F \u0432 \u0440\u0435\u043F\u043E\u0437\u0438\u0442\u043E\u0440\u0438\u0438";
+  if (!input.managedLauncher) return "\u0421\u0435\u0440\u0432\u0435\u0440 \u0437\u0430\u043F\u0443\u0449\u0435\u043D \u0431\u0435\u0437 managed launcher (`npm start`)";
+  if (!input.managedStatePresent) return "Launcher state \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D, \u043F\u0435\u0440\u0435\u0437\u0430\u043F\u0443\u0441\u043A \u043F\u043E\u0441\u043B\u0435 \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u044F \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D";
+  if (!input.upstreamPresent) return "\u0423 \u0442\u0435\u043A\u0443\u0449\u0435\u0439 \u0432\u0435\u0442\u043A\u0438 \u043D\u0435\u0442 upstream-\u0432\u0435\u0442\u043A\u0438 \u0434\u043B\u044F \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u044F";
+  return null;
+}
+function readPackageVersion() {
+  try {
+    const raw = fs4.readFileSync(path4.join(ROOT_DIR, "package.json"), "utf8");
+    const pkg = JSON.parse(raw);
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+function shortSha(value) {
+  return value ? value.slice(0, 10) : null;
+}
+function runningProgress(progress, message) {
+  return {
+    ...progress,
+    status: "running",
+    step: "checking",
+    message,
+    startedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    finishedAt: null,
+    error: null
+  };
+}
+async function getSupportState() {
+  const gitAvailable = await isGitAvailable();
+  const gitRepo = gitAvailable ? await isGitRepo(ROOT_DIR) : false;
+  const cleanWorktree = gitRepo ? await isWorktreeClean(ROOT_DIR) : false;
+  const managedLauncher = Boolean(process.env.ML_LAUNCHER_PID) && process.env.ML_MANAGED_LAUNCHER === "1";
+  const managed = readManagedState();
+  const upstream = managedLauncher && gitRepo ? await getUpstreamBranch(ROOT_DIR) : null;
+  const reason = getSupportReason({
+    gitAvailable,
+    gitRepo,
+    cleanWorktree,
+    managedLauncher,
+    managedStatePresent: Boolean(managed?.launcherPid),
+    upstreamPresent: Boolean(upstream)
+  });
+  return { supported: !reason, reason };
+}
+async function getUpdateStatus() {
+  const currentVersion = readPackageVersion();
+  const progress = readUpdateProgress();
+  const currentCommit = shortSha(await getHeadCommit(ROOT_DIR));
+  const trackedBranch = await getUpstreamBranch(ROOT_DIR);
+  const remoteCommit = trackedBranch ? shortSha(await getRemoteBranchHead(ROOT_DIR, trackedBranch)) : null;
+  const support = await getSupportState();
+  const hasUpdate = hasRemoteUpdate(currentCommit, remoteCommit);
+  return {
+    currentVersion,
+    currentCommit,
+    trackedBranch,
+    remoteCommit,
+    remoteVersion: null,
+    hasUpdate,
+    supported: support.supported,
+    supportReason: support.reason,
+    progress
+  };
+}
+async function startUpdate() {
+  const status = await getUpdateStatus();
+  if (!status.supported) {
+    throw new Error(status.supportReason ?? "\u0410\u0432\u0442\u043E\u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u043E");
+  }
+  if (!status.hasUpdate) {
+    throw new Error("\u041D\u043E\u0432\u043E\u0439 \u0432\u0435\u0440\u0441\u0438\u0438 \u043F\u043E\u043A\u0430 \u043D\u0435\u0442");
+  }
+  if (status.progress.status === "running") {
+    throw new Error("\u041E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 \u0443\u0436\u0435 \u0432\u044B\u043F\u043E\u043B\u043D\u044F\u0435\u0442\u0441\u044F");
+  }
+  writeUpdateProgress(
+    runningProgress(status.progress, `\u0413\u043E\u0442\u043E\u0432\u0438\u043C \u043E\u0431\u043D\u043E\u0432\u043B\u0435\u043D\u0438\u0435 ${status.currentCommit ?? ""} -> ${status.remoteCommit ?? ""}`.trim())
+  );
+  const child = spawn(process.execPath, [path4.join(ROOT_DIR, "scripts/self-update.mjs")], {
+    cwd: ROOT_DIR,
+    detached: true,
+    stdio: "ignore",
+    env: {
+      ...process.env,
+      ML_INSTALL_ROOT: ROOT_DIR,
+      ML_DATA_DIR: process.env.ML_DATA_DIR ?? "",
+      ML_LAUNCHER_PID: process.env.ML_LAUNCHER_PID ?? ""
+    }
+  });
+  child.unref();
+  logBridge.info("update", `self-update spawned pid=${child.pid ?? "?"}`);
+  return getUpdateStatus();
+}
+
+// src/update/handlers.ts
+function sendErr(reply, status, error) {
+  return reply.code(status).send({ ok: false, error });
+}
+async function getUpdateStatusHandler(_req, reply) {
+  return reply.send({ ok: true, update: await getUpdateStatus() });
+}
+async function postUpdateStartHandler(_req, reply) {
+  try {
+    const update = await startUpdate();
+    return reply.code(202).send({ ok: true, accepted: true, update });
+  } catch (e) {
+    return sendErr(reply, 400, e instanceof Error ? e.message : String(e));
+  }
+}
+
+// src/update/routes.ts
+async function registerUpdateRoutes(app) {
+  app.get("/api/update/status", getUpdateStatusHandler);
+  app.post("/api/update/start", postUpdateStartHandler);
+}
+
+// src/api/handlers.ts
+import { randomUUID } from "node:crypto";
+import { z as z2 } from "zod";
+
 // src/bridge/format.ts
 var MARKER_RE = /⟦bridge:(vk|tg|max):([^⟧]+)⟧/;
 function parseMarker(text) {
@@ -755,16 +1019,16 @@ async function postFormJson(url, form, opts = {}) {
 function lanFromSettings(s) {
   return { base: s.baseUrl.replace(/\/+$/, ""), lpat: s.lpat };
 }
-function lcUser(lc, path3, method = "GET", body, signal) {
-  return httpJson(`${lc.base}${path3}`, {
+function lcUser(lc, path5, method = "GET", body, signal) {
+  return httpJson(`${lc.base}${path5}`, {
     method,
     data: body,
     headers: { Authorization: `Bearer ${lc.lpat}` },
     signal
   });
 }
-function lcTopic(base, token, path3, method = "GET", body, signal) {
-  return httpJson(`${base.replace(/\/+$/, "")}${path3}`, {
+function lcTopic(base, token, path5, method = "GET", body, signal) {
+  return httpJson(`${base.replace(/\/+$/, "")}${path5}`, {
     method,
     data: body,
     headers: { Authorization: `Bearer ${token}` },
@@ -783,36 +1047,6 @@ async function lcTopicSend(base, token, text, files, signal) {
     form.append("file", new Blob([file.bytes], { type: file.mime || "application/octet-stream" }), file.filename);
   }
   return postFormJson(url, form, { headers: auth, signal, timeoutMs: 12e4 });
-}
-
-// src/bridge/logger.ts
-var logBridge = {
-  write(level, source, message, accountId) {
-    const row = insertLog({
-      level,
-      source,
-      accountId,
-      message: redactSecrets(message)
-    });
-    broadcastLive({ event: "log", data: row });
-    const line = `${row.ts} [${level}] ${source}${accountId ? `:${accountId.slice(0, 8)}` : ""} ${row.message}`;
-    if (level === "error") console.error(line);
-    else if (level === "warn") console.warn(line);
-    else console.log(line);
-  },
-  info(source, message, accountId) {
-    this.write("info", source, message, accountId);
-  },
-  warn(source, message, accountId) {
-    this.write("warn", source, message, accountId);
-  },
-  error(source, message, accountId) {
-    this.write("error", source, message, accountId);
-  }
-};
-function recordEvent(input) {
-  const row = insertEvent(input);
-  broadcastLive({ event: "bridge-event", data: row });
 }
 
 // src/bridge/media/gate.ts
@@ -1010,8 +1244,8 @@ async function tgApi(token, method, params = {}, signal) {
   if (!data.ok) throw new Error(`TG ${method}: ${JSON.stringify(data).slice(0, 240)}`);
   return data.result;
 }
-async function maxApi(token, method, path3, opts = {}) {
-  const url = new URL(path3, "https://platform-api2.max.ru");
+async function maxApi(token, method, path5, opts = {}) {
+  const url = new URL(path5, "https://platform-api2.max.ru");
   for (const [key, value] of Object.entries(opts.query ?? {})) {
     if (value === void 0 || value === "") continue;
     url.searchParams.set(key, String(value));
@@ -1231,9 +1465,9 @@ async function downloadTgFile(token, rec, fallbackName, fallbackMime, signal) {
   );
   if (!data.ok) throw new Error(`TG getFile: ${JSON.stringify(data).slice(0, 200)}`);
   const meta = asRecord(data.result);
-  const path3 = String(meta.file_path ?? "");
-  if (!path3) return null;
-  const { bytes, mime } = await fetchBytes(`https://api.telegram.org/file/bot${token}/${path3}`, {
+  const path5 = String(meta.file_path ?? "");
+  if (!path5) return null;
+  const { bytes, mime } = await fetchBytes(`https://api.telegram.org/file/bot${token}/${path5}`, {
     signal,
     timeoutMs: 9e4
   });
@@ -2568,7 +2802,7 @@ var botCommandPatchSchema = z.object({
 }).strict();
 
 // src/api/handlers.ts
-function sendErr(reply, status, error) {
+function sendErr2(reply, status, error) {
   return reply.code(status).send({ ok: false, error });
 }
 function publicSettings() {
@@ -2590,9 +2824,9 @@ function asRecord8(v) {
 async function resolveParentChatsTitles(req, reply) {
   const parsed = resolveParentChatsSchema.safeParse(req.body);
   if (!parsed.success)
-    return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441");
+    return sendErr2(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441");
   const s = getSettings();
-  if (!s.lpat || !s.lpat.startsWith("lpat_")) return sendErr(reply, 400, "\u0423\u043A\u0430\u0436\u0438 LPAT \u0432 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445");
+  if (!s.lpat || !s.lpat.startsWith("lpat_")) return sendErr2(reply, 400, "\u0423\u043A\u0430\u0436\u0438 LPAT \u0432 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445");
   const lc = lanFromSettings({
     ...s,
     baseUrl: httpBase(s.baseUrl),
@@ -2618,9 +2852,9 @@ async function resolveParentChatsTitles(req, reply) {
 async function resolveTopicChatsTitles(req, reply) {
   const parsed = resolveTopicChatsSchema.safeParse(req.body);
   if (!parsed.success)
-    return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441");
+    return sendErr2(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441");
   const s = getSettings();
-  if (!s.lpat || !s.lpat.startsWith("lpat_")) return sendErr(reply, 400, "\u0423\u043A\u0430\u0436\u0438 LPAT \u0432 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445");
+  if (!s.lpat || !s.lpat.startsWith("lpat_")) return sendErr2(reply, 400, "\u0423\u043A\u0430\u0436\u0438 LPAT \u0432 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445");
   const lc = lanFromSettings({
     ...s,
     baseUrl: httpBase(s.baseUrl),
@@ -2660,7 +2894,7 @@ async function getStatus(_req, reply) {
 }
 async function putSettings(req, reply) {
   const parsed = settingsPatchSchema.safeParse(req.body);
-  if (!parsed.success) return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0435 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438");
+  if (!parsed.success) return sendErr2(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0435 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0438");
   const patch = { ...parsed.data };
   if (patch.baseUrl) patch.baseUrl = httpBase(patch.baseUrl);
   if (patch.lpat !== void 0) patch.lpat = trimCfg(patch.lpat);
@@ -2686,7 +2920,7 @@ async function getBotCommands(_req, reply) {
 }
 async function postBotCommand(req, reply) {
   const parsed = botCommandCreateSchema.safeParse(req.body);
-  if (!parsed.success) return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u0430\u044F \u043A\u043E\u043C\u0430\u043D\u0434\u0430");
+  if (!parsed.success) return sendErr2(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u0430\u044F \u043A\u043E\u043C\u0430\u043D\u0434\u0430");
   const now = (/* @__PURE__ */ new Date()).toISOString();
   const v = parsed.data;
   const row = insertBotCommand({
@@ -2704,27 +2938,27 @@ async function postBotCommand(req, reply) {
 }
 async function patchBotCommand(req, reply) {
   const id = z2.string().uuid().safeParse(req.params.id);
-  if (!id.success) return sendErr(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
+  if (!id.success) return sendErr2(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
   const parsed = botCommandPatchSchema.safeParse(req.body);
-  if (!parsed.success) return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u0430\u044F \u043A\u043E\u043C\u0430\u043D\u0434\u0430");
+  if (!parsed.success) return sendErr2(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u0430\u044F \u043A\u043E\u043C\u0430\u043D\u0434\u0430");
   const patch = { ...parsed.data };
   if (patch.title !== void 0) patch.title = patch.title.trim();
   if (patch.trigger !== void 0) patch.trigger = patch.trigger.trim();
   if (patch.responseText !== void 0) patch.responseText = patch.responseText.trim();
   const next = updateBotCommand(id.data, patch);
-  if (!next) return sendErr(reply, 404, "\u041A\u043E\u043C\u0430\u043D\u0434\u0430 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430");
+  if (!next) return sendErr2(reply, 404, "\u041A\u043E\u043C\u0430\u043D\u0434\u0430 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430");
   return reply.send({ ok: true, command: next });
 }
 async function removeBotCommand(req, reply) {
   const id = z2.string().uuid().safeParse(req.params.id);
-  if (!id.success) return sendErr(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
-  if (!getBotCommand(id.data)) return sendErr(reply, 404, "\u041A\u043E\u043C\u0430\u043D\u0434\u0430 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430");
+  if (!id.success) return sendErr2(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
+  if (!getBotCommand(id.data)) return sendErr2(reply, 404, "\u041A\u043E\u043C\u0430\u043D\u0434\u0430 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430");
   deleteBotCommand(id.data);
   return reply.send({ ok: true });
 }
 async function postAccount(req, reply) {
   const parsed = accountCreateSchema.safeParse(req.body);
-  if (!parsed.success) return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0430\u043A\u043A\u0430\u0443\u043D\u0442");
+  if (!parsed.success) return sendErr2(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0430\u043A\u043A\u0430\u0443\u043D\u0442");
   const now = (/* @__PURE__ */ new Date()).toISOString();
   const v = parsed.data;
   const row = insertAccount({
@@ -2747,9 +2981,9 @@ async function postAccount(req, reply) {
 }
 async function patchAccount(req, reply) {
   const id = z2.string().uuid().safeParse(req.params.id);
-  if (!id.success) return sendErr(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
+  if (!id.success) return sendErr2(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
   const parsed = accountPatchSchema.safeParse(req.body);
-  if (!parsed.success) return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0430\u043A\u043A\u0430\u0443\u043D\u0442");
+  if (!parsed.success) return sendErr2(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0430\u043A\u043A\u0430\u0443\u043D\u0442");
   const patch = { ...parsed.data };
   if (patch.token !== void 0) patch.token = trimCfg(patch.token);
   if (patch.token === "") delete patch.token;
@@ -2759,17 +2993,17 @@ async function patchAccount(req, reply) {
   if (patch.topicTitle !== void 0) patch.topicTitle = trimCfg(patch.topicTitle);
   if (patch.topicChatId !== void 0) patch.topicChatId = trimCfg(patch.topicChatId);
   const next = updateAccount(id.data, patch);
-  if (!next) return sendErr(reply, 404, "\u0410\u043A\u043A\u0430\u0443\u043D\u0442 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
+  if (!next) return sendErr2(reply, 404, "\u0410\u043A\u043A\u0430\u0443\u043D\u0442 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
   if (next.kind === "vk" && next.enabled && !next.groupId) {
-    return sendErr(reply, 400, "\u0414\u043B\u044F VK \u0443\u043A\u0430\u0436\u0438 group id \u0441\u043E\u043E\u0431\u0449\u0435\u0441\u0442\u0432\u0430");
+    return sendErr2(reply, 400, "\u0414\u043B\u044F VK \u0443\u043A\u0430\u0436\u0438 group id \u0441\u043E\u043E\u0431\u0449\u0435\u0441\u0442\u0432\u0430");
   }
   await bridgeManager.syncIfRunning();
   return reply.send({ ok: true, account: toPublicAccount(next) });
 }
 async function removeAccount(req, reply) {
   const id = z2.string().uuid().safeParse(req.params.id);
-  if (!id.success) return sendErr(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
-  if (!deleteAccount(id.data)) return sendErr(reply, 404, "\u0410\u043A\u043A\u0430\u0443\u043D\u0442 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
+  if (!id.success) return sendErr2(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
+  if (!deleteAccount(id.data)) return sendErr2(reply, 404, "\u0410\u043A\u043A\u0430\u0443\u043D\u0442 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D");
   await bridgeManager.syncIfRunning();
   return reply.send({ ok: true });
 }
@@ -2778,7 +3012,7 @@ async function startBridge(_req, reply) {
     await bridgeManager.start();
     return reply.send({ ok: true, status: bridgeManager.getStatus() });
   } catch (e) {
-    return sendErr(reply, 400, e instanceof Error ? e.message : String(e));
+    return sendErr2(reply, 400, e instanceof Error ? e.message : String(e));
   }
 }
 async function stopBridge(_req, reply) {
@@ -2790,17 +3024,17 @@ async function restartBridge(_req, reply) {
     await bridgeManager.restart();
     return reply.send({ ok: true, status: bridgeManager.getStatus() });
   } catch (e) {
-    return sendErr(reply, 400, e instanceof Error ? e.message : String(e));
+    return sendErr2(reply, 400, e instanceof Error ? e.message : String(e));
   }
 }
 async function getLogs(req, reply) {
   const parsed = logsQuerySchema.safeParse(req.query);
-  if (!parsed.success) return sendErr(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441 \u043B\u043E\u0433\u043E\u0432");
+  if (!parsed.success) return sendErr2(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441 \u043B\u043E\u0433\u043E\u0432");
   return reply.send({ ok: true, logs: listLogs(parsed.data) });
 }
 async function getEvents(req, reply) {
   const parsed = eventsQuerySchema.safeParse(req.query);
-  if (!parsed.success) return sendErr(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441 \u0441\u043E\u0431\u044B\u0442\u0438\u0439");
+  if (!parsed.success) return sendErr2(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441 \u0441\u043E\u0431\u044B\u0442\u0438\u0439");
   return reply.send({ ok: true, events: listEvents(parsed.data.limit) });
 }
 async function streamLive(req, reply) {
@@ -2825,6 +3059,7 @@ async function registerApi(app) {
   app.get("/api/health", getHealth);
   app.get("/api/overview", getOverview);
   app.get("/api/status", getStatus);
+  await registerUpdateRoutes(app);
   app.put("/api/settings", putSettings);
   app.post("/api/parent-chats/titles", resolveParentChatsTitles);
   app.post("/api/topic-chats/titles", resolveTopicChatsTitles);
@@ -2860,7 +3095,7 @@ async function main() {
     }
   });
   await registerApi(app);
-  if (fs3.existsSync(WEB_DIST)) {
+  if (fs5.existsSync(WEB_DIST)) {
     await app.register(fastifyStatic, {
       root: WEB_DIST,
       prefix: "/"

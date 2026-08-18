@@ -756,6 +756,17 @@ function readManagedState() {
 function hasRemoteUpdate(currentCommit, remoteCommit) {
   return Boolean(currentCommit && remoteCommit && currentCommit !== remoteCommit);
 }
+function liveProgress(progress) {
+  if (progress.status !== "done") return progress;
+  return {
+    status: "idle",
+    step: "idle",
+    message: "",
+    startedAt: null,
+    finishedAt: null,
+    error: null
+  };
+}
 function getSupportReason(input) {
   if (!input.gitAvailable) return "Git \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D \u0432 \u0441\u0438\u0441\u0442\u0435\u043C\u0435";
   if (!input.gitRepo) return "\u0423\u0441\u0442\u0430\u043D\u043E\u0432\u043A\u0430 \u043D\u0435 \u044F\u0432\u043B\u044F\u0435\u0442\u0441\u044F git-\u043A\u043B\u043E\u043D\u043E\u043C";
@@ -807,7 +818,9 @@ async function getSupportState() {
 }
 async function getUpdateStatus() {
   const currentVersion = readPackageVersion();
-  const progress = readUpdateProgress();
+  const stored = readUpdateProgress();
+  const progress = liveProgress(stored);
+  if (stored.status === "done") writeUpdateProgress(progress);
   const currentCommit = shortSha(await getHeadCommit(ROOT_DIR));
   const trackedBranch = await getUpstreamBranch(ROOT_DIR);
   const remoteCommit = trackedBranch ? shortSha(await getRemoteBranchHead(ROOT_DIR, trackedBranch)) : null;

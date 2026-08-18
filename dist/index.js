@@ -852,7 +852,10 @@ async function startUpdate() {
   });
   child.unref();
   logBridge.info("update", `self-update spawned pid=${child.pid ?? "?"}`);
-  return getUpdateStatus();
+  return {
+    ...status,
+    progress: readUpdateProgress()
+  };
 }
 
 // src/update/handlers.ts

@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   enabled INTEGER NOT NULL DEFAULT 1,
   token TEXT NOT NULL,
   group_id TEXT NOT NULL DEFAULT '',
+  parent_chat_id TEXT NOT NULL DEFAULT '',
   topic_title TEXT NOT NULL DEFAULT '',
   topic_emoji TEXT NOT NULL DEFAULT '',
   topic_token TEXT NOT NULL DEFAULT '',
@@ -136,16 +137,29 @@ CREATE TABLE IF NOT EXISTS events (
   lan_message_id TEXT
 );
 
+CREATE TABLE IF NOT EXISTS bot_commands (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  trigger TEXT NOT NULL,
+  response_text TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  account_id TEXT NOT NULL DEFAULT '',
+  formatting_enabled INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs (id DESC);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events (id DESC);
 CREATE INDEX IF NOT EXISTS idx_routes_account ON routes (account_id);
+CREATE INDEX IF NOT EXISTS idx_bot_commands_enabled ON bot_commands (enabled, created_at DESC);
 `;
 
 // src/db/repo.ts
 var DEFAULT_SETTINGS = {
   baseUrl: "https://msgpublic.langame.ru",
   lpat: "",
-  parentChatId: "",
+  parentChatIds: [],
   wsUrl: "",
   vkApiVersion: "5.199",
   pollEmptySec: 1.2
@@ -161,10 +175,24 @@ function asAccount(row) {
     enabled: Number(row.enabled) === 1,
     token: String(row.token ?? ""),
     groupId: String(row.group_id ?? ""),
+    parentChatId: String(row.parent_chat_id ?? ""),
     topicTitle: String(row.topic_title ?? ""),
     topicEmoji: String(row.topic_emoji ?? ""),
     topicToken: String(row.topic_token ?? ""),
     topicChatId: String(row.topic_chat_id ?? ""),
+    createdAt: String(row.created_at ?? ""),
+    updatedAt: String(row.updated_at ?? "")
+  };
+}
+function asBotCommand(row) {
+  return {
+    id: String(row.id),
+    title: String(row.title ?? ""),
+    trigger: String(row.trigger ?? ""),
+    responseText: String(row.response_text ?? ""),
+    enabled: Number(row.enabled) === 1,
+    accountId: String(row.account_id ?? ""),
+    formattingEnabled: Number(row.formatting_enabled) === 1,
     createdAt: String(row.created_at ?? ""),
     updatedAt: String(row.updated_at ?? "")
   };
@@ -176,6 +204,7 @@ function toPublicAccount(row) {
     label: row.label,
     enabled: row.enabled,
     groupId: row.groupId,
+    parentChatId: row.parentChatId,
     topicTitle: row.topicTitle,
     topicEmoji: row.topicEmoji,
     topicChatId: row.topicChatId,
@@ -223,6 +252,34 @@ function migrateMessengerKind(opened) {
     opened.exec(SCHEMA_SQL);
   }
 }
+function ensureBotCommandsColumns(opened) {
+  const cols = opened.prepare("PRAGMA table_info(bot_commands)").all();
+  if (cols.length === 0) return;
+  const names = new Set(cols.map((c) => String(c.name ?? "")));
+  if (!names.has("account_id")) opened.exec("ALTER TABLE bot_commands ADD COLUMN account_id TEXT NOT NULL DEFAULT ''");
+  if (!names.has("formatting_enabled"))
+    opened.exec("ALTER TABLE bot_commands ADD COLUMN formatting_enabled INTEGER NOT NULL DEFAULT 0");
+  if (names.has("account_ids_json")) {
+    const rows = opened.prepare("SELECT id, account_ids_json, account_id FROM bot_commands").all();
+    const update = opened.prepare("UPDATE bot_commands SET account_id = ? WHERE id = ?");
+    for (const row of rows) {
+      if (row.account_id) continue;
+      try {
+        const parsed = JSON.parse(String(row.account_ids_json ?? "[]"));
+        const first = Array.isArray(parsed) ? String(parsed[0] ?? "") : "";
+        if (first) update.run(first, row.id);
+      } catch {
+      }
+    }
+  }
+}
+function ensureAccountsParentChatColumn(opened) {
+  const cols = opened.prepare("PRAGMA table_info(accounts)").all();
+  const names = new Set(cols.map((c) => String(c.name ?? "")));
+  if (!names.has("parent_chat_id")) {
+    opened.exec("ALTER TABLE accounts ADD COLUMN parent_chat_id TEXT NOT NULL DEFAULT ''");
+  }
+}
 var db = null;
 function getDb(filePath = DB_PATH) {
   if (db) return db;
@@ -232,6 +289,8 @@ function getDb(filePath = DB_PATH) {
   opened.pragma("foreign_keys = ON");
   opened.exec(SCHEMA_SQL);
   migrateMessengerKind(opened);
+  ensureAccountsParentChatColumn(opened);
+  ensureBotCommandsColumns(opened);
   seedSettings(opened);
   db = opened;
   return opened;
@@ -243,7 +302,7 @@ function seedSettings(opened) {
   const seed = {
     baseUrl: DEFAULT_SETTINGS.baseUrl,
     lpat: DEFAULT_SETTINGS.lpat,
-    parentChatId: DEFAULT_SETTINGS.parentChatId,
+    parentChatIds: DEFAULT_SETTINGS.parentChatIds.join(","),
     wsUrl: DEFAULT_SETTINGS.wsUrl,
     vkApiVersion: DEFAULT_SETTINGS.vkApiVersion,
     pollEmptySec: String(DEFAULT_SETTINGS.pollEmptySec)
@@ -257,10 +316,12 @@ function getSettings() {
   const rows = getDb().prepare("SELECT key, value FROM settings").all();
   const map = new Map(rows.map((r) => [r.key, r.value]));
   const poll = Number(map.get("pollEmptySec") ?? DEFAULT_SETTINGS.pollEmptySec);
+  const rawParents = String(map.get("parentChatIds") ?? map.get("parentChatId") ?? "");
+  const parentChatIds = rawParents.split(/[,\s]+/g).map((s) => s.trim()).filter(Boolean).slice(0, 20);
   return {
     baseUrl: map.get("baseUrl") ?? DEFAULT_SETTINGS.baseUrl,
     lpat: map.get("lpat") ?? "",
-    parentChatId: map.get("parentChatId") ?? "",
+    parentChatIds,
     wsUrl: map.get("wsUrl") ?? "",
     vkApiVersion: map.get("vkApiVersion") ?? DEFAULT_SETTINGS.vkApiVersion,
     pollEmptySec: Number.isFinite(poll) && poll > 0 ? poll : DEFAULT_SETTINGS.pollEmptySec
@@ -274,7 +335,7 @@ function setSettings(patch) {
   const tx = getDb().transaction(() => {
     upsert.run("baseUrl", next.baseUrl);
     upsert.run("lpat", next.lpat);
-    upsert.run("parentChatId", next.parentChatId);
+    upsert.run("parentChatIds", next.parentChatIds.join(","));
     upsert.run("wsUrl", next.wsUrl);
     upsert.run("vkApiVersion", next.vkApiVersion);
     upsert.run("pollEmptySec", String(next.pollEmptySec));
@@ -293,9 +354,9 @@ function getAccount(id) {
 function insertAccount(row) {
   getDb().prepare(
     `INSERT INTO accounts (
-        id, kind, label, enabled, token, group_id, topic_title, topic_emoji,
+        id, kind, label, enabled, token, group_id, parent_chat_id, topic_title, topic_emoji,
         topic_token, topic_chat_id, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     row.id,
     row.kind,
@@ -303,6 +364,7 @@ function insertAccount(row) {
     row.enabled ? 1 : 0,
     row.token,
     row.groupId,
+    row.parentChatId,
     row.topicTitle,
     row.topicEmoji,
     row.topicToken,
@@ -323,7 +385,7 @@ function updateAccount(id, patch) {
   };
   getDb().prepare(
     `UPDATE accounts SET
-        kind = ?, label = ?, enabled = ?, token = ?, group_id = ?, topic_title = ?,
+        kind = ?, label = ?, enabled = ?, token = ?, group_id = ?, parent_chat_id = ?, topic_title = ?,
         topic_emoji = ?, topic_token = ?, topic_chat_id = ?, updated_at = ?
       WHERE id = ?`
   ).run(
@@ -332,6 +394,7 @@ function updateAccount(id, patch) {
     next.enabled ? 1 : 0,
     next.token,
     next.groupId,
+    next.parentChatId,
     next.topicTitle,
     next.topicEmoji,
     next.topicToken,
@@ -343,6 +406,61 @@ function updateAccount(id, patch) {
 }
 function deleteAccount(id) {
   const info = getDb().prepare("DELETE FROM accounts WHERE id = ?").run(id);
+  return info.changes > 0;
+}
+function listBotCommands() {
+  const rows = getDb().prepare("SELECT * FROM bot_commands ORDER BY created_at DESC").all();
+  return rows.map(asBotCommand);
+}
+function getBotCommand(id) {
+  const row = getDb().prepare("SELECT * FROM bot_commands WHERE id = ?").get(id);
+  return row ? asBotCommand(row) : null;
+}
+function insertBotCommand(row) {
+  getDb().prepare(
+    `INSERT INTO bot_commands (
+        id, title, trigger, response_text, enabled, account_id, formatting_enabled, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    row.id,
+    row.title,
+    row.trigger,
+    row.responseText,
+    row.enabled ? 1 : 0,
+    row.accountId,
+    row.formattingEnabled ? 1 : 0,
+    row.createdAt,
+    row.updatedAt
+  );
+  return row;
+}
+function updateBotCommand(id, patch) {
+  const current = getBotCommand(id);
+  if (!current) return null;
+  const next = {
+    ...current,
+    ...patch,
+    id,
+    updatedAt: nowIso()
+  };
+  getDb().prepare(
+    `UPDATE bot_commands SET
+        title = ?, trigger = ?, response_text = ?, enabled = ?, account_id = ?, formatting_enabled = ?, updated_at = ?
+      WHERE id = ?`
+  ).run(
+    next.title,
+    next.trigger,
+    next.responseText,
+    next.enabled ? 1 : 0,
+    next.accountId,
+    next.formattingEnabled ? 1 : 0,
+    next.updatedAt,
+    id
+  );
+  return next;
+}
+function deleteBotCommand(id) {
+  const info = getDb().prepare("DELETE FROM bot_commands WHERE id = ?").run(id);
   return info.changes > 0;
 }
 function upsertRoute(route) {
@@ -583,10 +701,19 @@ var MAX_BRIDGE_FILE_BYTES = 45 * 1024 * 1024;
 var MAX_FILES_PER_MESSAGE = 8;
 
 // src/bridge/media/httpFiles.ts
+function normalizeMaxUrl(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname === "platform-api.max.ru") u.hostname = "platform-api2.max.ru";
+    return u.toString();
+  } catch {
+    return url.replace("platform-api.max.ru", "platform-api2.max.ru");
+  }
+}
 async function fetchBytes(url, opts = {}) {
   const timeout = AbortSignal.timeout(opts.timeoutMs ?? 6e4);
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
-  const res = await fetch(url, { method: "GET", headers: opts.headers, signal, redirect: "follow" });
+  const res = await fetch(normalizeMaxUrl(url), { method: "GET", headers: opts.headers, signal, redirect: "follow" });
   if (!res.ok) {
     throw new Error(`GET ${url} \u2192 HTTP ${res.status}`);
   }
@@ -605,6 +732,7 @@ async function readCapped(res, maxBytes) {
 async function postFormJson(url, form, opts = {}) {
   const timeout = AbortSignal.timeout(opts.timeoutMs ?? 9e4);
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout;
+  const normalizedUrl = normalizeMaxUrl(url);
   const res = await fetch(url, {
     method: "POST",
     headers: opts.headers,
@@ -613,7 +741,7 @@ async function postFormJson(url, form, opts = {}) {
   });
   const raw = await res.text();
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status} POST ${url}: ${raw.slice(0, 400)}`);
+    throw new Error(`HTTP ${res.status} POST ${normalizedUrl}: ${raw.slice(0, 400)}`);
   }
   if (!raw) return null;
   try {
@@ -888,13 +1016,101 @@ async function maxApi(token, method, path3, opts = {}) {
     if (value === void 0 || value === "") continue;
     url.searchParams.set(key, String(value));
   }
-  return httpJson(url.toString(), {
-    method,
-    data: opts.data,
-    headers: { Authorization: token },
-    timeoutMs: opts.timeoutMs ?? 4e4,
-    signal: opts.signal
-  });
+  const t = token.trim();
+  const target = url.toString();
+  async function requestWithAuth(auth) {
+    return httpJson(target, {
+      method,
+      data: opts.data,
+      headers: { Authorization: auth },
+      timeoutMs: opts.timeoutMs ?? 4e4,
+      signal: opts.signal
+    });
+  }
+  const authBearer = /^bearer\s+/i.test(t) ? t : `Bearer ${t}`;
+  const authRaw = t;
+  try {
+    return await requestWithAuth(authBearer);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const cause = e instanceof Error && "cause" in e ? (
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      String(e.cause ?? "")
+    ) : "";
+    if (msg.includes("verify.token") && msg.toLowerCase().includes("malformed access token")) {
+      try {
+        return await requestWithAuth(authRaw);
+      } catch {
+      }
+    }
+    throw new Error(`Max request failed: ${msg}${cause ? `; cause: ${cause}` : ""} (${target})`);
+  }
+}
+
+// src/bridge/markup.ts
+function decodeHtml(text) {
+  return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+}
+function stripTags(text) {
+  return decodeHtml(text.replace(/<[^>]+>/g, ""));
+}
+function toMaxFormattedText(text) {
+  if (!text.trim()) return { text };
+  return { text, textFormat: "HTML" };
+}
+function toVkFormattedText(text) {
+  const raw = text || "";
+  if (!raw.includes("<")) return { text: decodeHtml(raw) };
+  const tokens = raw.split(/(<[^>]+>)/g).filter(Boolean);
+  const active = [];
+  const items = [];
+  let out = "";
+  for (const token of tokens) {
+    if (!token.startsWith("<")) {
+      const chunk = decodeHtml(token);
+      const offset = out.length;
+      out += chunk;
+      const length = chunk.length;
+      if (!length) continue;
+      for (const mark of active) items.push({ type: mark.type, offset, length, url: mark.url });
+      continue;
+    }
+    const close = /^<\s*\/\s*([a-z0-9-]+)\s*>$/i.exec(token);
+    if (close) {
+      const name2 = close[1]?.toLowerCase() ?? "";
+      const mapped = name2 === "b" || name2 === "strong" ? "bold" : name2 === "i" || name2 === "em" ? "italic" : name2 === "u" || name2 === "ins" ? "underline" : name2 === "s" || name2 === "strike" || name2 === "del" ? "strikethrough" : name2 === "a" ? "url" : null;
+      if (!mapped) continue;
+      for (let i = active.length - 1; i >= 0; i--) {
+        if (active[i]?.type === mapped) {
+          active.splice(i, 1);
+          break;
+        }
+      }
+      continue;
+    }
+    const open = /^<\s*([a-z0-9-]+)([^>]*)>$/i.exec(token);
+    if (!open) continue;
+    const name = open[1]?.toLowerCase() ?? "";
+    const attrs = open[2] ?? "";
+    if (name === "b" || name === "strong") active.push({ type: "bold" });
+    else if (name === "i" || name === "em") active.push({ type: "italic" });
+    else if (name === "u" || name === "ins") active.push({ type: "underline" });
+    else if (name === "s" || name === "strike" || name === "del") active.push({ type: "strikethrough" });
+    else if (name === "a") {
+      const href = /href\s*=\s*"([^"]+)"/i.exec(attrs)?.[1] ?? /href\s*=\s*'([^']+)'/i.exec(attrs)?.[1] ?? "";
+      active.push({ type: "url", url: href });
+    } else if (name === "br") out += "\n";
+  }
+  const merged = [];
+  for (const item of items) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.type === item.type && prev.url === item.url && prev.offset + prev.length === item.offset) {
+      prev.length += item.length;
+    } else {
+      merged.push({ ...item });
+    }
+  }
+  return merged.length ? { text: stripTags(out), formatData: { version: "1", items: merged } } : { text: stripTags(out) };
 }
 
 // src/bridge/media/max.ts
@@ -934,7 +1150,7 @@ function maxUploadType(file) {
   if (mime.startsWith("audio/")) return "audio";
   return "file";
 }
-async function sendMaxFiles(token, peerId, text, files, signal) {
+async function sendMaxFiles(token, peerId, text, files, formattingEnabled = false, signal) {
   const attachments = [];
   for (const file of files) {
     const type = maxUploadType(file);
@@ -950,7 +1166,13 @@ async function sendMaxFiles(token, peerId, text, files, signal) {
     if (!tokenVal) throw new Error("Max upload: no token");
     attachments.push({ type, payload: { token: tokenVal } });
   }
-  const body = { text: text.trim() || (attachments.length ? "" : "(\u043F\u0443\u0441\u0442\u043E)") };
+  const fallbackText = text.trim() || (attachments.length ? "" : "(\u043F\u0443\u0441\u0442\u043E)");
+  const formatted = formattingEnabled ? toMaxFormattedText(fallbackText) : null;
+  const body = { text: formatted?.text ?? fallbackText };
+  if (formatted?.textFormat) {
+    body.text_format = formatted.textFormat;
+    body.format = formatted.textFormat;
+  }
   if (attachments.length) body.attachments = attachments;
   await sendMaxWithRetry(token, peerId, body, signal);
 }
@@ -1021,12 +1243,16 @@ async function downloadTgFile(token, rec, fallbackName, fallbackMime, signal) {
     bytes
   };
 }
-async function sendTelegramFiles(token, peerId, text, files, signal) {
+async function sendTelegramFiles(token, peerId, text, files, formattingEnabled = false, signal) {
   const caption = text.trim().slice(0, 1024);
   if (files.length === 0) {
     await httpJson(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
-      data: { chat_id: Number(peerId), text: text.trim() || "(\u043F\u0443\u0441\u0442\u043E)" },
+      data: {
+        chat_id: Number(peerId),
+        text: text.trim() || "(\u043F\u0443\u0441\u0442\u043E)",
+        parse_mode: formattingEnabled ? "HTML" : void 0
+      },
       signal
     });
     return;
@@ -1038,6 +1264,7 @@ async function sendTelegramFiles(token, peerId, text, files, signal) {
     const kind = tgSendKind(file);
     form.append(kind, new Blob([file.bytes], { type: file.mime || "application/octet-stream" }), file.filename);
     if (first && caption) form.append("caption", caption);
+    if (first && formattingEnabled) form.append("parse_mode", "HTML");
     first = false;
     const method = kind === "photo" ? "sendPhoto" : kind === "video" ? "sendVideo" : kind === "audio" ? "sendAudio" : "sendDocument";
     const data = asRecord(
@@ -1116,7 +1343,7 @@ async function filesFromVk(attachments, signal) {
   }
   return out;
 }
-async function sendVkFiles(account, settings, peerId, text, files, signal) {
+async function sendVkFiles(account, settings, peerId, text, files, formattingEnabled = false, signal) {
   const peer = Number(peerId);
   const attachmentIds = [];
   for (const file of files) {
@@ -1127,6 +1354,8 @@ async function sendVkFiles(account, settings, peerId, text, files, signal) {
       attachmentIds.push(await uploadVkDoc(account, settings, peer, file, signal));
     }
   }
+  const fallbackText = text.trim() || (attachmentIds.length ? "" : "(\u043F\u0443\u0441\u0442\u043E)");
+  const formatted = formattingEnabled ? toVkFormattedText(fallbackText) : null;
   await vkApi(
     account.token,
     settings.vkApiVersion,
@@ -1134,8 +1363,9 @@ async function sendVkFiles(account, settings, peerId, text, files, signal) {
     {
       peer_id: peer,
       random_id: Math.floor(Math.random() * 2e9) + 1,
-      message: text.trim() || (attachmentIds.length ? "" : "(\u043F\u0443\u0441\u0442\u043E)"),
-      attachment: attachmentIds.join(",") || void 0
+      message: formatted?.text ?? fallbackText,
+      attachment: attachmentIds.join(",") || void 0,
+      format_data: formatted?.formatData ? JSON.stringify(formatted.formatData) : void 0
     },
     signal
   );
@@ -1296,18 +1526,58 @@ async function deliverOutbound(settings, account, route, text, files = [], signa
     logBridge.warn("media", `drop out ${skip.name}: ${skip.reason}`, account.id);
   }
   if (route.messenger === "vk") {
-    await sendVkFiles(account, settings, route.peerId, text, gated.ok, signal);
+    await sendVkFiles(account, settings, route.peerId, text, gated.ok, false, signal);
     return;
   }
   if (route.messenger === "tg") {
-    await sendTelegramFiles(account.token, route.peerId, text, gated.ok, signal);
+    await sendTelegramFiles(account.token, route.peerId, text, gated.ok, false, signal);
     return;
   }
   if (route.messenger === "max") {
-    await sendMaxFiles(account.token, route.peerId, text, gated.ok, signal);
+    await sendMaxFiles(account.token, route.peerId, text, gated.ok, false, signal);
     return;
   }
   throw new Error(`unknown messenger ${route.messenger}`);
+}
+
+// src/bridge/autoReplies.ts
+function normalizeTrigger(text) {
+  return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+function normalizeIncomingCommand(text) {
+  const norm = normalizeTrigger(text);
+  if (!norm.startsWith("/")) return null;
+  const first = norm.split(" ")[0] ?? "";
+  return first.includes("@") ? first.split("@")[0] ?? first : first;
+}
+function matchBotCommand(accountId, text) {
+  const needleCmd = normalizeIncomingCommand(text);
+  if (!needleCmd) return null;
+  for (const cmd of listBotCommands()) {
+    if (!cmd.enabled) continue;
+    if (cmd.accountId !== accountId) continue;
+    const triggerCmd = normalizeIncomingCommand(cmd.trigger) ?? normalizeTrigger(cmd.trigger);
+    if (triggerCmd === needleCmd) return cmd;
+  }
+  return null;
+}
+async function maybeSendBotCommandReply(settings, account, peerId, text, signal) {
+  const cmd = matchBotCommand(account.id, text);
+  if (!cmd) return false;
+  logBridge.info("cmd", `match ${cmd.trigger} \u2192 auto reply`, account.id);
+  if (account.kind === "vk") {
+    await sendVkFiles(account, settings, peerId, cmd.responseText, [], cmd.formattingEnabled, signal);
+    return true;
+  }
+  if (account.kind === "tg") {
+    await sendTelegramFiles(account.token, peerId, cmd.responseText, [], cmd.formattingEnabled, signal);
+    return true;
+  }
+  if (account.kind === "max") {
+    await sendMaxFiles(account.token, peerId, cmd.responseText, [], cmd.formattingEnabled, signal);
+    return true;
+  }
+  return false;
 }
 
 // src/bridge/telegram.ts
@@ -1337,7 +1607,13 @@ async function telegramLoop(settings, account, bind, signal) {
         const uid = String(fromU.id ?? "");
         const uname = fromU.username ? `@${fromU.username}` : "";
         const name = [fromU.first_name, fromU.last_name].filter(Boolean).join(" ").trim() || uname || uid;
-        const inbound = telegramInboundText(String(m.text ?? m.caption ?? ""));
+        const rawIncoming = String(m.text ?? m.caption ?? "");
+        const inbound = telegramInboundText(rawIncoming);
+        try {
+          await maybeSendBotCommandReply(settings, account, chatId, rawIncoming, signal);
+        } catch (e) {
+          logBridge.warn("tg", `cmd ${String(e)}`, account.id);
+        }
         let files = [];
         try {
           files = await filesFromTelegram(account.token, m, signal);
@@ -1406,6 +1682,17 @@ function displayName(user) {
 async function ingest(settings, account, bind, input, signal) {
   if (!input.peerId) return;
   const inbound = botStartInboundText(input.text, input.started);
+  try {
+    await maybeSendBotCommandReply(
+      settings,
+      account,
+      input.peerId,
+      input.started ? "/start" : input.rawText ?? input.text,
+      signal
+    );
+  } catch (e) {
+    logBridge.warn("max", `cmd ${String(e)}`, account.id);
+  }
   const files = input.files ?? [];
   const nAtt = files.length || input.nAtt;
   const text = formatInbound({
@@ -1479,6 +1766,7 @@ async function handleUpdate(settings, account, bind, raw, signal) {
       peerId,
       ...user,
       text: String(body.text ?? message.text ?? ""),
+      rawText: String(body.text ?? message.text ?? ""),
       nAtt: files.length || attachments.length,
       files
     },
@@ -1516,7 +1804,11 @@ async function maxLoop(settings, account, bind, signal) {
       }
     } catch (e) {
       if (signal.aborted) return;
-      logBridge.warn("max", `poll ${String(e)}`, account.id);
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("verify.token") || msg.toLowerCase().includes("malformed access token") || msg.includes("HTTP 401")) {
+        throw e;
+      }
+      logBridge.warn("max", `poll ${msg}`, account.id);
       await sleep2(2e3, signal);
     }
   }
@@ -1539,19 +1831,19 @@ function sleep2(ms, signal) {
 function asRecord6(v) {
   return v && typeof v === "object" ? v : {};
 }
-async function listTopics(settings, signal) {
+async function listTopics(settings, parentChatId, signal) {
   const lc = lanFromSettings(settings);
-  const listed = await lcUser(lc, `/api/public/chats/${settings.parentChatId}/topics`, "GET", void 0, signal);
+  const listed = await lcUser(lc, `/api/public/chats/${parentChatId}/topics`, "GET", void 0, signal);
   const rec = asRecord6(listed);
   const items = Array.isArray(rec.topics) ? rec.topics : listed;
   return Array.isArray(items) ? items.map(asRecord6) : [];
 }
-async function topicToken(settings, topicId, signal) {
+async function topicToken(settings, parentChatId, topicId, signal) {
   const lc = lanFromSettings(settings);
   const tok = asRecord6(
     await lcUser(
       lc,
-      `/api/public/chats/${settings.parentChatId}/topics/${topicId}/channel-token`,
+      `/api/public/chats/${parentChatId}/topics/${topicId}/channel-token`,
       "GET",
       void 0,
       signal
@@ -1578,18 +1870,27 @@ async function ensureTopic(settings, account, signal) {
   if (token && chatId) {
     return { accountId: account.id, key: account.kind, title, chatId, token };
   }
+  const parentChatIds = account.parentChatId.trim() ? [account.parentChatId.trim()] : settings.parentChatIds ?? [];
   if (token && !chatId) {
-    if (settings.lpat.startsWith("lpat_") && settings.parentChatId) {
-      for (const t of await listTopics(settings, signal)) {
-        const tid = String(t.id ?? "");
-        if (!tid) continue;
-        try {
-          if (await topicToken(settings, tid, signal) === token) {
-            persistTopic(account.id, token, tid, title);
-            return { accountId: account.id, key: account.kind, title: String(t.title || title), chatId: tid, token };
+    if (settings.lpat.startsWith("lpat_") && parentChatIds.length > 0) {
+      for (const parentChatId of parentChatIds) {
+        for (const t of await listTopics(settings, parentChatId, signal)) {
+          const tid = String(t.id ?? "");
+          if (!tid) continue;
+          try {
+            if (await topicToken(settings, parentChatId, tid, signal) === token) {
+              persistTopic(account.id, token, tid, title);
+              return {
+                accountId: account.id,
+                key: account.kind,
+                title: String(t.title || title),
+                chatId: tid,
+                token
+              };
+            }
+          } catch (e) {
+            logBridge.warn("topic", `token lookup ${tid}: ${String(e)}`, account.id);
           }
-        } catch (e) {
-          logBridge.warn("topic", `token lookup ${tid}: ${String(e)}`, account.id);
         }
       }
     }
@@ -1601,29 +1902,40 @@ async function ensureTopic(settings, account, signal) {
       logBridge.warn("topic", `infer chatId: ${String(e)}`, account.id);
     }
   }
-  if (!settings.lpat.startsWith("lpat_") || !settings.parentChatId) {
+  if (!settings.lpat.startsWith("lpat_") || parentChatIds.length === 0) {
     throw new Error(
-      `\u0442\u0435\u043C\u0430 \xAB${title}\xBB: \u0443\u043A\u0430\u0436\u0438 token+chat id \u0442\u0435\u043C\u044B \u0438\u043B\u0438 LPAT + parent chat \u0434\u043B\u044F \u0430\u0432\u0442\u043E\u0441\u043E\u0437\u0434\u0430\u043D\u0438\u044F`
+      `\u0442\u0435\u043C\u0430 \xAB${title}\xBB: \u0443\u043A\u0430\u0436\u0438 token+chat id \u0442\u0435\u043C\u044B \u0438\u043B\u0438 LPAT + parent chats \u0434\u043B\u044F \u0430\u0432\u0442\u043E\u0441\u043E\u0437\u0434\u0430\u043D\u0438\u044F`
     );
   }
-  const items = await listTopics(settings, signal);
-  let found = items.find((t) => String(t.title ?? "").trim().toLowerCase() === title.toLowerCase()) ?? null;
+  let found = null;
+  let foundParentChatId = parentChatIds[0];
+  for (const parentChatId of parentChatIds) {
+    const items = await listTopics(settings, parentChatId, signal);
+    const f = items.find((t) => String(t.title ?? "").trim().toLowerCase() === title.toLowerCase()) ?? null;
+    if (f) {
+      found = f;
+      foundParentChatId = parentChatId;
+      break;
+    }
+  }
   if (!found) {
+    const parentChatId = parentChatIds[0];
     const created = asRecord6(
       await lcUser(
         lanFromSettings(settings),
-        `/api/public/chats/${settings.parentChatId}/topics`,
+        `/api/public/chats/${parentChatId}/topics`,
         "POST",
         { title },
         signal
       )
     );
     found = created;
+    foundParentChatId = parentChatId;
     logBridge.info("topic", `created \xAB${title}\xBB ${String(created.id ?? "")}`, account.id);
   }
   chatId = String(found.id ?? "");
   if (!chatId) throw new Error("topic create/list returned no id");
-  if (!token) token = await topicToken(settings, chatId, signal);
+  if (!token) token = await topicToken(settings, foundParentChatId, chatId, signal);
   persistTopic(account.id, token, chatId, title);
   return { accountId: account.id, key: account.kind, title, chatId, token };
 }
@@ -1741,6 +2053,11 @@ async function ingest2(settings, account, bind, m, signal) {
   }
   const nAtt = files.length || nAttListed;
   const source = await groupTitle(account, settings, signal);
+  try {
+    await maybeSendBotCommandReply(settings, account, peer, String(m.text ?? ""), signal);
+  } catch (e) {
+    logBridge.warn("vk", `cmd ${String(e)}`, account.id);
+  }
   const text = formatInbound({
     messenger: "vk",
     name,
@@ -2167,7 +2484,7 @@ function normalizedSettings() {
     ...s,
     baseUrl: httpBase(s.baseUrl),
     lpat: trimCfg(s.lpat),
-    parentChatId: trimCfg(s.parentChatId),
+    parentChatIds: s.parentChatIds.map(trimCfg).filter(Boolean),
     wsUrl: trimCfg(s.wsUrl),
     vkApiVersion: trimCfg(s.vkApiVersion) || "5.199"
   };
@@ -2180,6 +2497,8 @@ var trimmed = z.string().trim();
 var settingsPatchSchema = z.object({
   baseUrl: trimmed.url().max(500).optional(),
   lpat: trimmed.max(500).optional(),
+  parentChatIds: z.array(trimmed.max(80)).optional(),
+  // backwards compatibility (single UUID)
   parentChatId: trimmed.max(80).optional(),
   wsUrl: trimmed.max(500).optional(),
   vkApiVersion: trimmed.max(20).optional(),
@@ -2190,6 +2509,7 @@ var accountCreateSchema = z.object({
   label: trimmed.min(1).max(80),
   token: trimmed.min(1).max(800),
   groupId: trimmed.max(32).optional().default(""),
+  parentChatId: trimmed.max(80).optional().default(""),
   enabled: z.boolean().optional().default(true),
   topicTitle: trimmed.max(80).optional().default(""),
   topicEmoji: trimmed.max(8).optional().default(""),
@@ -2209,6 +2529,7 @@ var accountPatchSchema = z.object({
   label: trimmed.min(1).max(80).optional(),
   token: trimmed.max(800).optional(),
   groupId: trimmed.max(32).optional(),
+  parentChatId: trimmed.max(80).optional(),
   enabled: z.boolean().optional(),
   topicTitle: trimmed.max(80).optional(),
   topicEmoji: trimmed.max(8).optional(),
@@ -2223,6 +2544,28 @@ var logsQuerySchema = z.object({
 var eventsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional().default(40)
 });
+var resolveParentChatsSchema = z.object({
+  ids: z.array(trimmed.max(80)).min(1).max(20)
+}).strict();
+var resolveTopicChatsSchema = z.object({
+  ids: z.array(trimmed.max(80)).min(1).max(50)
+}).strict();
+var botCommandCreateSchema = z.object({
+  title: trimmed.min(1).max(80),
+  trigger: trimmed.min(1).max(80),
+  responseText: trimmed.min(1).max(4e3),
+  enabled: z.boolean().optional().default(true),
+  accountId: trimmed.uuid(),
+  formattingEnabled: z.boolean().optional().default(false)
+}).strict();
+var botCommandPatchSchema = z.object({
+  title: trimmed.min(1).max(80).optional(),
+  trigger: trimmed.min(1).max(80).optional(),
+  responseText: trimmed.min(1).max(4e3).optional(),
+  enabled: z.boolean().optional(),
+  accountId: trimmed.uuid().optional(),
+  formattingEnabled: z.boolean().optional()
+}).strict();
 
 // src/api/handlers.ts
 function sendErr(reply, status, error) {
@@ -2234,12 +2577,70 @@ function publicSettings() {
     baseUrl: s.baseUrl,
     lpatHint: maskSecret(s.lpat),
     hasLpat: Boolean(s.lpat),
-    parentChatId: s.parentChatId,
+    parentChatIds: s.parentChatIds,
     wsUrl: s.wsUrl,
     vkApiVersion: s.vkApiVersion,
     pollEmptySec: s.pollEmptySec,
     resolvedWsUrl: s.wsUrl.trim() || defaultWsUrl(httpBase(s.baseUrl || "https://msgpublic.langame.ru"))
   };
+}
+function asRecord8(v) {
+  return v && typeof v === "object" ? v : {};
+}
+async function resolveParentChatsTitles(req, reply) {
+  const parsed = resolveParentChatsSchema.safeParse(req.body);
+  if (!parsed.success)
+    return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441");
+  const s = getSettings();
+  if (!s.lpat || !s.lpat.startsWith("lpat_")) return sendErr(reply, 400, "\u0423\u043A\u0430\u0436\u0438 LPAT \u0432 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445");
+  const lc = lanFromSettings({
+    ...s,
+    baseUrl: httpBase(s.baseUrl),
+    lpat: trimCfg(s.lpat)
+  });
+  const titles = {};
+  for (const id of parsed.data.ids) {
+    try {
+      const raw = await lcUser(lc, `/api/public/chats/${id}/title`, "GET", void 0);
+      if (typeof raw === "string") {
+        titles[id] = raw.trim();
+        continue;
+      }
+      const rec = asRecord8(raw);
+      titles[id] = String(rec.title ?? rec.tittle ?? rec.name ?? "").trim();
+    } catch (e) {
+      titles[id] = "";
+      logBridge.warn("topic", `resolve chat ${id}: ${String(e)}`);
+    }
+  }
+  return reply.send({ ok: true, titles });
+}
+async function resolveTopicChatsTitles(req, reply) {
+  const parsed = resolveTopicChatsSchema.safeParse(req.body);
+  if (!parsed.success)
+    return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 \u0437\u0430\u043F\u0440\u043E\u0441");
+  const s = getSettings();
+  if (!s.lpat || !s.lpat.startsWith("lpat_")) return sendErr(reply, 400, "\u0423\u043A\u0430\u0436\u0438 LPAT \u0432 \u043D\u0430\u0441\u0442\u0440\u043E\u0439\u043A\u0430\u0445");
+  const lc = lanFromSettings({
+    ...s,
+    baseUrl: httpBase(s.baseUrl),
+    lpat: trimCfg(s.lpat)
+  });
+  const titles = {};
+  const parentChatIds = s.parentChatIds ?? [];
+  for (const topicId of parsed.data.ids) {
+    let title = "";
+    for (const parentChatId of parentChatIds) {
+      try {
+        const topic = asRecord8(await lcUser(lc, `/api/public/chats/${parentChatId}/topics/${topicId}`, "GET", void 0));
+        title = String(topic.title ?? "");
+        if (title) break;
+      } catch {
+      }
+    }
+    titles[topicId] = title;
+  }
+  return reply.send({ ok: true, titles });
 }
 async function getHealth(_req, reply) {
   return reply.send({ ok: true });
@@ -2264,7 +2665,14 @@ async function putSettings(req, reply) {
   if (patch.baseUrl) patch.baseUrl = httpBase(patch.baseUrl);
   if (patch.lpat !== void 0) patch.lpat = trimCfg(patch.lpat);
   if (patch.lpat === "") delete patch.lpat;
-  if (patch.parentChatId !== void 0) patch.parentChatId = trimCfg(patch.parentChatId);
+  if (patch.parentChatIds !== void 0) {
+    patch.parentChatIds = patch.parentChatIds.map(trimCfg).filter(Boolean);
+  }
+  if (patch.parentChatId !== void 0 && patch.parentChatIds === void 0) {
+    const single = trimCfg(patch.parentChatId);
+    patch.parentChatIds = single ? [single] : [];
+  }
+  delete patch.parentChatId;
   if (patch.wsUrl !== void 0) patch.wsUrl = trimCfg(patch.wsUrl);
   setSettings(patch);
   if (bridgeManager.running) await bridgeManager.restart();
@@ -2272,6 +2680,47 @@ async function putSettings(req, reply) {
 }
 async function getAccounts(_req, reply) {
   return reply.send({ ok: true, accounts: listAccounts().map(toPublicAccount) });
+}
+async function getBotCommands(_req, reply) {
+  return reply.send({ ok: true, commands: listBotCommands() });
+}
+async function postBotCommand(req, reply) {
+  const parsed = botCommandCreateSchema.safeParse(req.body);
+  if (!parsed.success) return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u0430\u044F \u043A\u043E\u043C\u0430\u043D\u0434\u0430");
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const v = parsed.data;
+  const row = insertBotCommand({
+    id: randomUUID(),
+    title: v.title.trim(),
+    trigger: v.trigger.trim(),
+    responseText: v.responseText.trim(),
+    enabled: v.enabled,
+    accountId: v.accountId,
+    formattingEnabled: v.formattingEnabled,
+    createdAt: now,
+    updatedAt: now
+  });
+  return reply.code(201).send({ ok: true, command: row });
+}
+async function patchBotCommand(req, reply) {
+  const id = z2.string().uuid().safeParse(req.params.id);
+  if (!id.success) return sendErr(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
+  const parsed = botCommandPatchSchema.safeParse(req.body);
+  if (!parsed.success) return sendErr(reply, 400, parsed.error.issues[0]?.message ?? "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u0430\u044F \u043A\u043E\u043C\u0430\u043D\u0434\u0430");
+  const patch = { ...parsed.data };
+  if (patch.title !== void 0) patch.title = patch.title.trim();
+  if (patch.trigger !== void 0) patch.trigger = patch.trigger.trim();
+  if (patch.responseText !== void 0) patch.responseText = patch.responseText.trim();
+  const next = updateBotCommand(id.data, patch);
+  if (!next) return sendErr(reply, 404, "\u041A\u043E\u043C\u0430\u043D\u0434\u0430 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430");
+  return reply.send({ ok: true, command: next });
+}
+async function removeBotCommand(req, reply) {
+  const id = z2.string().uuid().safeParse(req.params.id);
+  if (!id.success) return sendErr(reply, 400, "\u041D\u0435\u043A\u043E\u0440\u0440\u0435\u043A\u0442\u043D\u044B\u0439 id");
+  if (!getBotCommand(id.data)) return sendErr(reply, 404, "\u041A\u043E\u043C\u0430\u043D\u0434\u0430 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430");
+  deleteBotCommand(id.data);
+  return reply.send({ ok: true });
 }
 async function postAccount(req, reply) {
   const parsed = accountCreateSchema.safeParse(req.body);
@@ -2285,6 +2734,7 @@ async function postAccount(req, reply) {
     enabled: v.enabled,
     token: trimCfg(v.token),
     groupId: trimCfg(v.groupId),
+    parentChatId: trimCfg(v.parentChatId),
     topicTitle: trimCfg(v.topicTitle),
     topicEmoji: trimCfg(v.topicEmoji),
     topicToken: trimCfg(v.topicToken),
@@ -2305,6 +2755,7 @@ async function patchAccount(req, reply) {
   if (patch.token === "") delete patch.token;
   if (patch.topicToken !== void 0) patch.topicToken = trimCfg(patch.topicToken);
   if (patch.groupId !== void 0) patch.groupId = trimCfg(patch.groupId);
+  if (patch.parentChatId !== void 0) patch.parentChatId = trimCfg(patch.parentChatId);
   if (patch.topicTitle !== void 0) patch.topicTitle = trimCfg(patch.topicTitle);
   if (patch.topicChatId !== void 0) patch.topicChatId = trimCfg(patch.topicChatId);
   const next = updateAccount(id.data, patch);
@@ -2375,10 +2826,16 @@ async function registerApi(app) {
   app.get("/api/overview", getOverview);
   app.get("/api/status", getStatus);
   app.put("/api/settings", putSettings);
+  app.post("/api/parent-chats/titles", resolveParentChatsTitles);
+  app.post("/api/topic-chats/titles", resolveTopicChatsTitles);
   app.get("/api/accounts", getAccounts);
   app.post("/api/accounts", postAccount);
   app.patch("/api/accounts/:id", patchAccount);
   app.delete("/api/accounts/:id", removeAccount);
+  app.get("/api/bot-commands", getBotCommands);
+  app.post("/api/bot-commands", postBotCommand);
+  app.patch("/api/bot-commands/:id", patchBotCommand);
+  app.delete("/api/bot-commands/:id", removeBotCommand);
   app.post("/api/bridge/start", startBridge);
   app.post("/api/bridge/stop", stopBridge);
   app.post("/api/bridge/restart", restartBridge);
